@@ -79,6 +79,9 @@ class GarminConnectRequest(BaseModel):
     email: str
     password: str
 
+class GarminSyncRequest(BaseModel):
+    uid: str
+
 # === HEALTH CHECK (Fly.io, load balancer) ===
 @app.get("/")
 def health():
@@ -103,7 +106,8 @@ async def connect_garmin(req: GarminConnectRequest):
             "garmin_last_email": req.email
         }, merge=True)
 
-        synced_activities = sync_user(uid, client)
+        sync_result = sync_user(uid, client)
+        synced_activities = sync_result["activities_synced"]
         logger.success(f"✅ Garmin collegato per UID {uid} (attivita sync: {synced_activities})")
         return {
             "success": True,
@@ -136,11 +140,30 @@ async def connect_garmin(req: GarminConnectRequest):
         logger.error(f"Errore {uid}: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Errore interno del server")
 
+# === ENDPOINT SYNC IMMEDIATA (pull-to-refresh / login app) ===
+@app.post("/garmin/sync")
+async def sync_garmin(req: GarminSyncRequest):
+    uid = req.uid.strip()
+    sync_result = sync_user(uid)
+    if not sync_result["success"]:
+        detail = sync_result["message"]
+        status_code = 404 if "non collegato" in detail.lower() else 500
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    return {
+        "success": True,
+        "message": f"Sync Garmin completata. Sincronizzate {sync_result['activities_synced']} attivita."
+    }
+
 # === SYNC PER UTENTE (usa client attivo o token salvato) ===
 def sync_user(uid: str, client: Garmin | None = None):
     token_subdir = os.path.join(TOKENS_DIR, uid)
     if client is None and not os.path.isdir(token_subdir):
-        return
+        return {
+            "success": False,
+            "activities_synced": 0,
+            "message": "Account Garmin non collegato. Esegui prima il login Garmin."
+        }
     os.environ["GARMINTOKENS"] = os.path.abspath(token_subdir)
     try:
         if client is None:
@@ -161,10 +184,18 @@ def sync_user(uid: str, client: Garmin | None = None):
         batch.commit()
 
         logger.success(f"Sync ok per {uid}")
-        return len(activities)
+        return {
+            "success": True,
+            "activities_synced": len(activities),
+            "message": "Sync completata"
+        }
     except Exception as e:
         logger.error(f"Sync fallito {uid}: {e}")
-        return 0
+        return {
+            "success": False,
+            "activities_synced": 0,
+            "message": str(e),
+        }
 
 # === SCHEDULER (multi-utente) ===
 def scheduled_sync():
