@@ -11,15 +11,14 @@ if (-not (Get-Command fly -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# 2. FIREBASE_CREDENTIALS
+# 2. FIREBASE_CREDENTIALS_B64
 if (Test-Path "firebase-service-account.json") {
-    Write-Host "`nImpostazione FIREBASE_CREDENTIALS..." -ForegroundColor Yellow
-    $creds = Get-Content "firebase-service-account.json" -Raw
-    fly secrets set "FIREBASE_CREDENTIALS=$creds"
-    Write-Host "OK: FIREBASE_CREDENTIALS impostato" -ForegroundColor Green
+    Write-Host "`nImpostazione FIREBASE_CREDENTIALS_B64..." -ForegroundColor Yellow
+    & ".\set-firebase-secret.ps1"
+    Write-Host "OK: FIREBASE_CREDENTIALS_B64 impostato" -ForegroundColor Green
 } else {
     Write-Host "`nATTENZIONE: firebase-service-account.json non trovato." -ForegroundColor Yellow
-    Write-Host "Impostalo manualmente: fly secrets set FIREBASE_CREDENTIALS='{...}'" -ForegroundColor Yellow
+    Write-Host "Impostalo manualmente eseguendo: .\set-firebase-secret.ps1" -ForegroundColor Yellow
 }
 
 # 3. Volumi (servono 2 per 2 machine in iad)

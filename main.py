@@ -30,6 +30,7 @@ from pydantic import BaseModel
 load_dotenv()
 
 app = FastAPI(title="Garmin Sync - FitAI Analyzer")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # === FIREBASE (secret - mai nel Docker image) ===
 # Supporta FIREBASE_CREDENTIALS (JSON) o FIREBASE_CREDENTIALS_B64 (base64)
@@ -66,9 +67,10 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-logger.add("garmin.log", rotation="10 MB", level="INFO")
+logger.add(os.path.join(BASE_DIR, "garmin.log"), rotation="10 MB", level="INFO")
 
-TOKENS_DIR = "./tokens"
+# Usa sempre un path assoluto: su Fly il volume e' montato in /app/tokens.
+TOKENS_DIR = os.getenv("GARMINTOKENS_ROOT", os.path.join(BASE_DIR, "tokens"))
 os.makedirs(TOKENS_DIR, exist_ok=True)
 
 # === MODELLO PER IL LOGIN DALL'APP ===
@@ -88,7 +90,7 @@ async def connect_garmin(req: GarminConnectRequest):
     uid = req.uid.strip()
     token_subdir = os.path.join(TOKENS_DIR, uid)
     os.makedirs(token_subdir, exist_ok=True)
-    os.environ["GARMINTOKENS"] = token_subdir   # <-- importante per il tuo setup
+    os.environ["GARMINTOKENS"] = os.path.abspath(token_subdir)   # <-- importante per il tuo setup
 
     try:
         client = Garmin(req.email, req.password)
@@ -133,9 +135,9 @@ async def connect_garmin(req: GarminConnectRequest):
 # === SYNC PER UTENTE (usa token salvato) ===
 def sync_user(uid: str):
     token_subdir = os.path.join(TOKENS_DIR, uid)
-    if not os.path.exists(token_subdir):
+    if not os.path.isdir(token_subdir):
         return
-    os.environ["GARMINTOKENS"] = token_subdir
+    os.environ["GARMINTOKENS"] = os.path.abspath(token_subdir)
     try:
         garth.resume()
         client = Garmin()   # usa token
