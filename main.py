@@ -15,6 +15,13 @@ except ImportError:
     from garminconnect import Garmin, GarminConnectConnectionError
     GarminConnectAuthenticationError = GarminConnectConnectionError  # fallback
 import garth
+try:
+    from garth.exc import GarthException, GarthHTTPError
+except ImportError:
+    class _DummyGarthException(Exception):
+        pass
+    GarthException = _DummyGarthException
+    GarthHTTPError = _DummyGarthException
 from apscheduler.schedulers.background import BackgroundScheduler
 from loguru import logger
 from fastapi import FastAPI, HTTPException
@@ -97,15 +104,30 @@ async def connect_garmin(req: GarminConnectRequest):
         logger.success(f"✅ Garmin collegato per UID {uid}")
         return {"success": True, "message": "Garmin collegato correttamente!"}
 
-    except (GarminConnectConnectionError, GarminConnectAuthenticationError):
+    except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException):
         logger.warning(f"Login fallito per {uid} (credenziali non valide)")
         raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
+    except GarthHTTPError as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in (401, 403):
+            logger.warning(f"Login fallito per {uid} (HTTP {status})")
+            raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
+        logger.error(f"Errore HTTP Garmin {uid}: {status} - {e}")
+        raise HTTPException(status_code=500, detail="Errore interno del server")
     except Exception as e:
-        err_msg = str(e).lower()
-        if "401" in err_msg or "unauthorized" in err_msg or "authentication" in err_msg or "login" in err_msg:
+        def _all_messages(exc):
+            msgs = [str(exc)]
+            if exc.__cause__:
+                msgs.append(str(exc.__cause__))
+            if exc.__context__:
+                msgs.append(str(exc.__context__))
+            return " ".join(msgs).lower()
+        err_msg = _all_messages(e)
+        auth_keywords = ("401", "unauthorized", "authentication", "login", "invalid", "credential", "password", "forbidden", "403", "client error")
+        if any(kw in err_msg for kw in auth_keywords):
             logger.warning(f"Login fallito per {uid}: {e}")
             raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
-        logger.error(f"Errore {uid}: {e}")
+        logger.error(f"Errore {uid}: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Errore interno del server")
 
 # === SYNC PER UTENTE (usa token salvato) ===
