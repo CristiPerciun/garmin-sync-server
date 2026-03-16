@@ -103,8 +103,12 @@ async def connect_garmin(req: GarminConnectRequest):
             "garmin_last_email": req.email
         }, merge=True)
 
-        logger.success(f"✅ Garmin collegato per UID {uid}")
-        return {"success": True, "message": "Garmin collegato correttamente!"}
+        synced_activities = sync_user(uid, client)
+        logger.success(f"✅ Garmin collegato per UID {uid} (attivita sync: {synced_activities})")
+        return {
+            "success": True,
+            "message": f"Garmin collegato correttamente. Sincronizzate {synced_activities} attivita."
+        }
 
     except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException):
         logger.warning(f"Login fallito per {uid} (credenziali non valide)")
@@ -132,15 +136,16 @@ async def connect_garmin(req: GarminConnectRequest):
         logger.error(f"Errore {uid}: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Errore interno del server")
 
-# === SYNC PER UTENTE (usa token salvato) ===
-def sync_user(uid: str):
+# === SYNC PER UTENTE (usa client attivo o token salvato) ===
+def sync_user(uid: str, client: Garmin | None = None):
     token_subdir = os.path.join(TOKENS_DIR, uid)
-    if not os.path.isdir(token_subdir):
+    if client is None and not os.path.isdir(token_subdir):
         return
     os.environ["GARMINTOKENS"] = os.path.abspath(token_subdir)
     try:
-        garth.resume()
-        client = Garmin()   # usa token
+        if client is None:
+            garth.resume()
+            client = Garmin()   # usa token
 
         today = datetime.now().strftime("%Y-%m-%d")
         activities = client.get_activities(0, 20)
@@ -156,8 +161,10 @@ def sync_user(uid: str):
         batch.commit()
 
         logger.success(f"Sync ok per {uid}")
+        return len(activities)
     except Exception as e:
         logger.error(f"Sync fallito {uid}: {e}")
+        return 0
 
 # === SCHEDULER (multi-utente) ===
 def scheduled_sync():
