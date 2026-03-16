@@ -139,7 +139,7 @@ if __name__ == "__main__":
     scheduler.add_job(scheduled_sync, "interval", minutes=45)
     scheduler.start()
 
-    # Health check + API su PORT di Fly.io
-    port = int(os.getenv("PORT", 8000))
+    # Health check + API: Fly.io usa internal_port 8080, imposta PORT=8080
+    port = int(os.getenv("PORT", "8080"))
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)
