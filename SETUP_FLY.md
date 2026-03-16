@@ -1,5 +1,22 @@
 # Setup Fly.io - garmin-sync-server
 
+## Ordine corretto (sicuro)
+
+1. **Imposta il secret** (usa base64 – evita problemi encoding su Windows):
+   ```powershell
+   cd C:\Users\c.perciun\Documents\Custom_WorkSpace\garmin-sync-server
+   .\set-firebase-secret.ps1
+   ```
+
+2. **Deploy**:
+   ```powershell
+   fly deploy --app garmin-sync-server
+   ```
+
+Il secret `FIREBASE_CREDENTIALS_B64` è base64 del JSON: nessun problema con caratteri speciali o newline.
+
+---
+
 ## Script automatico (PowerShell)
 
 Con `firebase-service-account.json` nella cartella del progetto:

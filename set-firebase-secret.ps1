@@ -1,4 +1,4 @@
-# Imposta FIREBASE_CREDENTIALS su Fly.io
+# Imposta FIREBASE_CREDENTIALS_B64 su Fly.io (base64 - evita problemi encoding)
 # Esegui dalla cartella garmin-sync-server dove si trova firebase-service-account.json
 
 $ErrorActionPreference = "Stop"
@@ -9,25 +9,18 @@ if (-not (Test-Path $jsonPath)) {
     exit 1
 }
 
-$json = Get-Content $jsonPath -Raw -Encoding UTF8
-$json = $json.Trim().TrimStart([char]0xFEFF)  # rimuovi BOM
+$jsonBytes = [System.IO.File]::ReadAllBytes($jsonPath)
+$b64 = [Convert]::ToBase64String($jsonBytes)
 
-# Verifica che sia JSON valido
+# Verifica che il JSON sia valido
 try {
+    $json = [System.Text.Encoding]::UTF8.GetString($jsonBytes)
     $null = $json | ConvertFrom-Json
 } catch {
     Write-Host "ERRORE: Il file non e' JSON valido" -ForegroundColor Red
     exit 1
 }
 
-# Salva in file temporaneo e usa @ per fly (evita problemi con caratteri speciali in PowerShell)
-$tmpFile = [System.IO.Path]::GetTempFileName()
-[System.IO.File]::WriteAllText($tmpFile, $json, [System.Text.UTF8Encoding]::new($false))
-
-try {
-    Write-Host "Impostazione FIREBASE_CREDENTIALS su Fly.io..." -ForegroundColor Yellow
-    fly secrets set "FIREBASE_CREDENTIALS=@$tmpFile" --app garmin-sync-server
-    Write-Host "OK: Secret impostato. La macchina si riavviera' automaticamente." -ForegroundColor Green
-} finally {
-    Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
-}
+Write-Host "Impostazione FIREBASE_CREDENTIALS_B64 su Fly.io (base64)..." -ForegroundColor Yellow
+fly secrets set "FIREBASE_CREDENTIALS_B64=$b64" --app garmin-sync-server
+Write-Host "OK: Secret impostato. La macchina si riavviera' automaticamente." -ForegroundColor Green

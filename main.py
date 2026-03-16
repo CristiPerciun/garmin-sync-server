@@ -16,28 +16,34 @@ load_dotenv()
 
 app = FastAPI(title="Garmin Sync - FitAI Analyzer")
 
-# === FIREBASE ===
+# === FIREBASE (secret - mai nel Docker image) ===
+# Supporta FIREBASE_CREDENTIALS (JSON) o FIREBASE_CREDENTIALS_B64 (base64)
+# Base64 evita problemi con caratteri speciali/newline su Windows
 def _load_firebase_cred():
-    firebase_creds = os.getenv("FIREBASE_CREDENTIALS")
-    if firebase_creds:
-        s = firebase_creds.strip().lstrip("\ufeff")  # strip BOM
-        if not s:
-            logger.error("FIREBASE_CREDENTIALS è vuoto")
-            raise ValueError("FIREBASE_CREDENTIALS vuoto")
+    import base64
+
+    # 1. Prova JSON diretto
+    raw = os.getenv("FIREBASE_CREDENTIALS")
+    if raw:
+        s = raw.strip().lstrip("\ufeff")
+        if s:
+            try:
+                return credentials.Certificate(json.loads(s))
+            except json.JSONDecodeError:
+                pass
+
+    # 2. Prova base64 (consigliato: evita problemi encoding)
+    b64 = os.getenv("FIREBASE_CREDENTIALS_B64")
+    if b64:
         try:
-            return credentials.Certificate(json.loads(s))
-        except json.JSONDecodeError as e:
-            # Se sembra un path (es. @file su Windows ha passato il path)
-            if os.path.isfile(s.strip('"').strip("'")):
-                path = s.strip('"').strip("'")
-                logger.info(f"Carico credenziali da file: {path}")
-                return credentials.Certificate(path)
-            logger.error(f"FIREBASE_CREDENTIALS non è JSON valido: {e}")
-            raise
-    if os.path.exists("firebase-service-account.json"):
-        return credentials.Certificate("firebase-service-account.json")
-    logger.error("Manca firebase-service-account.json o FIREBASE_CREDENTIALS")
-    raise ValueError("Configura FIREBASE_CREDENTIALS su Fly: fly secrets set FIREBASE_CREDENTIALS=@firebase-service-account.json")
+            decoded = base64.b64decode(b64.strip()).decode("utf-8")
+            return credentials.Certificate(json.loads(decoded))
+        except Exception as e:
+            logger.error(f"FIREBASE_CREDENTIALS_B64 non valido: {e}")
+            raise ValueError("FIREBASE_CREDENTIALS_B64 non valido. Riesegui .\\set-firebase-secret.ps1")
+
+    logger.error("Manca FIREBASE_CREDENTIALS o FIREBASE_CREDENTIALS_B64")
+    raise ValueError("Esegui: .\\set-firebase-secret.ps1")
 
 cred = _load_firebase_cred()
 
