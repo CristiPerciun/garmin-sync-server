@@ -5,7 +5,15 @@ from datetime import datetime
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore
-from garminconnect import Garmin, GarminConnectConnectionError
+try:
+    from garminconnect import (
+        Garmin,
+        GarminConnectConnectionError,
+        GarminConnectAuthenticationError,
+    )
+except ImportError:
+    from garminconnect import Garmin, GarminConnectConnectionError
+    GarminConnectAuthenticationError = GarminConnectConnectionError  # fallback
 import garth
 from apscheduler.schedulers.background import BackgroundScheduler
 from loguru import logger
@@ -89,10 +97,14 @@ async def connect_garmin(req: GarminConnectRequest):
         logger.success(f"✅ Garmin collegato per UID {uid}")
         return {"success": True, "message": "Garmin collegato correttamente!"}
 
-    except GarminConnectConnectionError:
-        logger.warning(f"Login fallito per {uid}")
+    except (GarminConnectConnectionError, GarminConnectAuthenticationError):
+        logger.warning(f"Login fallito per {uid} (credenziali non valide)")
         raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
     except Exception as e:
+        err_msg = str(e).lower()
+        if "401" in err_msg or "unauthorized" in err_msg or "authentication" in err_msg or "login" in err_msg:
+            logger.warning(f"Login fallito per {uid}: {e}")
+            raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
         logger.error(f"Errore {uid}: {e}")
         raise HTTPException(status_code=500, detail="Errore interno del server")
 
