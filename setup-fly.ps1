@@ -22,14 +22,15 @@ if (Test-Path "firebase-service-account.json") {
     Write-Host "Impostalo manualmente: fly secrets set FIREBASE_CREDENTIALS='{...}'" -ForegroundColor Yellow
 }
 
-# 3. Volume
-Write-Host "`nCreazione volume garmin_tokens (se non esiste)..." -ForegroundColor Yellow
+# 3. Volumi (servono 2 per 2 machine in iad)
+Write-Host "`nCreazione volumi garmin_tokens (2 necessari)..." -ForegroundColor Yellow
 $volumes = fly volumes list 2>$null
-if ($volumes -match "garmin_tokens") {
-    Write-Host "OK: Volume garmin_tokens già presente" -ForegroundColor Green
+$count = ([regex]::Matches($volumes, "garmin_tokens")).Count
+if ($count -ge 2) {
+    Write-Host "OK: Volumi garmin_tokens già presenti ($count)" -ForegroundColor Green
 } else {
-    fly volumes create garmin_tokens --region iad --size 1
-    Write-Host "OK: Volume creato" -ForegroundColor Green
+    fly volumes create garmin_tokens --region iad --count 2
+    Write-Host "OK: Volumi creati" -ForegroundColor Green
 }
 
 Write-Host "`n=== Setup completato ===" -ForegroundColor Cyan

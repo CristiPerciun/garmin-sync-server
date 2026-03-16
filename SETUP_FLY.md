@@ -44,11 +44,15 @@ fly secrets set FIREBASE_CREDENTIALS="$(cat firebase-service-account.json)"
 
 Senza volume, i token si perdono a ogni restart e gli utenti devono riconnettersi.
 
-### Crea il volume (una sola volta)
+### Crea i volumi (una sola volta)
+
+L'app richiede **2 volumi** (2 machine in iad):
 
 ```bash
-fly volumes create garmin_tokens --region iad --size 1
+fly volumes create garmin_tokens --region iad --count 2
 ```
+
+Poi esegui `fly deploy`.
 
 ### Verifica
 
