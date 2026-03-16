@@ -1,7 +1,9 @@
 import json
 import os
+import threading
 import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from dotenv import load_dotenv
 import firebase_admin
@@ -119,9 +121,32 @@ def sync_garmin_data() -> None:
         logger.error(f"Errore sync: {e}")
 
 
+# === HEALTH CHECK (per Fly.io / cloud: risponde su PORT) ===
+def run_health_server() -> None:
+    """Server HTTP minimale per health check – Fly.io richiede risposta su PORT."""
+    port = int(os.getenv("PORT", 8080))
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, *args: object) -> None:
+            pass  # silenzia log HTTP
+
+    with HTTPServer(("", port), HealthHandler) as httpd:
+        logger.info(f"Health check su :{port}")
+        httpd.serve_forever()
+
+
 # === SCHEDULER ===
 if __name__ == "__main__":
     logger.info("Server Garmin Sync avviato")
+
+    # Avvia health server in background (per Fly.io)
+    threading.Thread(target=run_health_server, daemon=True).start()
 
     scheduler = BackgroundScheduler()
     scheduler.add_job(
