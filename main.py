@@ -1,167 +1,119 @@
 import json
 import os
-import threading
 import time
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore
 from garminconnect import Garmin, GarminConnectConnectionError
+import garth
 from apscheduler.schedulers.background import BackgroundScheduler
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 load_dotenv()
 
-# Garth/Garmin token store – usa GARTH_HOME per persistenza su Railway/volume
-# garminconnect legge GARMINTOKENS come path della cartella token
-garth_home = os.getenv("GARTH_HOME", "./garth_tokens")
-if not os.path.isabs(garth_home):
-    garth_home = os.path.abspath(garth_home)
-os.makedirs(garth_home, exist_ok=True)
-os.environ["GARMINTOKENS"] = garth_home
+app = FastAPI(title="Garmin Sync - FitAI Analyzer")
 
-# === CONFIG ===
-USER_ID = os.getenv("USER_ID")
-if not USER_ID:
-    logger.error("USER_ID mancante in .env!")
-    exit(1)
-
-# === FIREBASE ===
-# Supporta file locale O variabile FIREBASE_CREDENTIALS (JSON) per Railway/cloud
+# === FIREBASE (uguale al tuo vecchio codice) ===
 firebase_creds = os.getenv("FIREBASE_CREDENTIALS")
 if firebase_creds:
     cred = credentials.Certificate(json.loads(firebase_creds))
 elif os.path.exists("firebase-service-account.json"):
     cred = credentials.Certificate("firebase-service-account.json")
 else:
-    logger.error("Serve firebase-service-account.json o variabile FIREBASE_CREDENTIALS")
+    logger.error("Manca firebase-service-account.json o FIREBASE_CREDENTIALS")
     exit(1)
 
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# === LOGGING (best practice) ===
-logger.add("garmin_sync.log", rotation="10 MB", level="INFO")
+logger.add("garmin.log", rotation="10 MB", level="INFO")
 
+TOKENS_DIR = "./tokens"
+os.makedirs(TOKENS_DIR, exist_ok=True)
 
-# === GARMIN CLIENT ===
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=5, max=30),
-    retry=retry_if_exception_type(GarminConnectConnectionError),
-)
-def get_garmin_client() -> Garmin:
-    client = Garmin(os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD"))
-    client.login()
-    return client
+# === MODELLO PER IL LOGIN DALL'APP ===
+class GarminConnectRequest(BaseModel):
+    uid: str
+    email: str
+    password: str
 
+# === ENDPOINT CHE VUOI (il tasto "Connect Garmin") ===
+@app.post("/garmin/connect")
+async def connect_garmin(req: GarminConnectRequest):
+    uid = req.uid.strip()
+    token_subdir = os.path.join(TOKENS_DIR, uid)
+    os.makedirs(token_subdir, exist_ok=True)
+    os.environ["GARMINTOKENS"] = token_subdir   # <-- importante per il tuo setup
 
-# === SYNC PRINCIPALE ===
-def sync_garmin_data() -> None:
-    logger.info(f"[{datetime.now()}] Inizio sincronizzazione Garmin...")
     try:
-        client = get_garmin_client()
+        client = Garmin(req.email, req.password)
+        client.login()   # salva token automaticamente
+
+        # Marca utente come collegato su Firestore
+        db.collection("users").document(uid).set({
+            "garmin_linked": True,
+            "garmin_linked_at": datetime.utcnow().isoformat(),
+            "garmin_last_email": req.email
+        }, merge=True)
+
+        logger.success(f"✅ Garmin collegato per UID {uid}")
+        return {"success": True, "message": "Garmin collegato correttamente!"}
+
+    except GarminConnectConnectionError:
+        logger.warning(f"Login fallito per {uid}")
+        raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
+    except Exception as e:
+        logger.error(f"Errore {uid}: {e}")
+        raise HTTPException(status_code=500, detail="Errore interno del server")
+
+# === SYNC PER UTENTE (usa token salvato) ===
+def sync_user(uid: str):
+    token_subdir = os.path.join(TOKENS_DIR, uid)
+    if not os.path.exists(token_subdir):
+        return
+    os.environ["GARMINTOKENS"] = token_subdir
+    try:
+        garth.resume()
+        client = Garmin()   # usa token
 
         today = datetime.now().strftime("%Y-%m-%d")
-
-        # Dati principali (best practice: solo ultimi 30 giorni per non sovraccaricare)
-        activities = client.get_activities(0, 30)
-        stats = client.get_stats(today)
-        hr = client.get_heart_rates(today)
-        sleep = client.get_sleep_data(today)
+        activities = client.get_activities(0, 20)
 
         batch = db.batch()
-        collection_prefix = f"users/{USER_ID}"
-
-        # Attività
+        prefix = f"users/{uid}"
         for act in activities:
-            doc_ref = db.collection(f"{collection_prefix}/garmin_activities").document(
-                str(act["activityId"])
-            )
-            batch.set(
-                doc_ref,
-                {
-                    "activityId": act["activityId"],
-                    "startTime": act["startTimeGMT"],
-                    "activityType": act["activityType"]["typeKey"],
-                    "distance": act.get("distance"),
-                    "duration": act.get("duration"),
-                    "averageHR": act.get("averageHR"),
-                    "calories": act.get("calories"),
-                    "rawData": act,
-                    "syncedAt": datetime.utcnow().isoformat(),
-                },
-                merge=True,
-            )
+            doc_ref = db.collection(f"{prefix}/garmin_activities").document(str(act.get("activityId")))
+            batch.set(doc_ref, {**act, "syncedAt": datetime.utcnow().isoformat()}, merge=True)
 
-        # Dati giornalieri
-        daily_ref = db.collection(f"{collection_prefix}/garmin_daily").document(today)
-        batch.set(
-            daily_ref,
-            {
-                "date": today,
-                "stats": stats,
-                "heartRate": hr,
-                "sleep": sleep,
-                "syncedAt": datetime.utcnow().isoformat(),
-            },
-            merge=True,
-        )
-
+        daily_ref = db.collection(f"{prefix}/garmin_daily").document(today)
+        batch.set(daily_ref, {"date": today, "syncedAt": datetime.utcnow().isoformat()}, merge=True)
         batch.commit()
-        logger.success(
-            f"[{datetime.now()}] Sync completato! {len(activities)} attività salvate."
-        )
 
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"Errore sync: {e}")
+        logger.success(f"Sync ok per {uid}")
+    except Exception as e:
+        logger.error(f"Sync fallito {uid}: {e}")
 
+# === SCHEDULER (multi-utente) ===
+def scheduled_sync():
+    logger.info("Inizio sync batch...")
+    users = db.collection("users").where("garmin_linked", "==", True).stream()
+    for user in users:
+        sync_user(user.id)
+        time.sleep(10)   # rate-limit Garmin
 
-# === HEALTH CHECK (per Fly.io / cloud: risponde su PORT) ===
-def run_health_server() -> None:
-    """Server HTTP minimale per health check – Fly.io richiede risposta su PORT."""
-    port = int(os.getenv("PORT", 8080))
-
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
-
-        def log_message(self, *args: object) -> None:
-            pass  # silenzia log HTTP
-
-    with HTTPServer(("", port), HealthHandler) as httpd:
-        logger.info(f"Health check su :{port}")
-        httpd.serve_forever()
-
-
-# === SCHEDULER ===
+# === AVVIO (compatibile Fly.io) ===
 if __name__ == "__main__":
-    logger.info("Server Garmin Sync avviato")
-
-    # Avvia health server in background (per Fly.io)
-    threading.Thread(target=run_health_server, daemon=True).start()
+    logger.info("🚀 Server avviato con API + sync")
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        sync_garmin_data,
-        "interval",
-        minutes=int(os.getenv("SYNC_INTERVAL_MINUTES", 45)),
-        id="garmin_sync",
-        replace_existing=True,
-    )
+    scheduler.add_job(scheduled_sync, "interval", minutes=45)
     scheduler.start()
 
-    # Mantieni vivo + graceful shutdown
-    try:
-        while True:
-            time.sleep(60)
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
-        logger.info("Server fermato correttamente")
+    # Health check + API su PORT di Fly.io
+    port = int(os.getenv("PORT", 8000))
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=port)

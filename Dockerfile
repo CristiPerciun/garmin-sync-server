@@ -14,5 +14,6 @@ COPY . .
 
 # Cartella token persistente
 RUN mkdir -p /app/garth_tokens && chmod 700 /app/garth_tokens
+RUN mkdir -p /app/tokens && chmod -R 700 /app/tokens
 
 CMD ["python", "main.py"]

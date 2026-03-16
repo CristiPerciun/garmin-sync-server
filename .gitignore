@@ -5,9 +5,12 @@ firebase-service-account.json
 # Token Garmin (contengono dati sensibili) - la cartella resta, non i file
 garth_tokens/*
 !garth_tokens/.gitkeep
+tokens/*
+!tokens/.gitkeep
 
 # Log
 garmin_sync.log
+garmin.log
 
 # Python
 __pycache__/

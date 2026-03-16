@@ -1,11 +1,17 @@
 # Garmin Connect
-garminconnect==0.2.38
+garminconnect
+garth>=0.6.3
 
-# Backend / env
+# Backend
 firebase-admin>=6.4.0
 python-dotenv>=1.0.0
 
-# Scheduler, logging, retry
+# Scheduler + logging
 apscheduler>=3.10.0
 loguru>=0.7.0
 tenacity>=8.0.0
+
+# API per il login dall'app Flutter
+fastapi
+uvicorn[standard]
+pydantic
