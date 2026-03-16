@@ -1,0 +1,25 @@
+# Segreti - NON commitare
+.env
+firebase-service-account.json
+
+# Token Garmin (contengono dati sensibili) - la cartella resta, non i file
+garth_tokens/*
+!garth_tokens/.gitkeep
+
+# Log
+garmin_sync.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env.local
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

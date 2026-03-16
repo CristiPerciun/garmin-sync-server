@@ -1,0 +1,11 @@
+# Garmin Connect
+garminconnect==0.2.38
+
+# Backend / env
+firebase-admin>=6.4.0
+python-dotenv>=1.0.0
+
+# Scheduler, logging, retry
+apscheduler>=3.10.0
+loguru>=0.7.0
+tenacity>=8.0.0

@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+firebase-service-account.json
+garth_tokens/*
+.git
+.gitignore
+__pycache__
+*.pyc
+.venv
+venv
+.idea
+.vscode
+*.md
