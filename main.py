@@ -41,7 +41,12 @@ class GarminConnectRequest(BaseModel):
     email: str
     password: str
 
-# === ENDPOINT CHE VUOI (il tasto "Connect Garmin") ===
+# === HEALTH CHECK (Fly.io, load balancer) ===
+@app.get("/")
+def health():
+    return {"status": "ok", "service": "garmin-sync-server"}
+
+# === ENDPOINT LOGIN GARMIN (il tasto "Connect Garmin") ===
 @app.post("/garmin/connect")
 async def connect_garmin(req: GarminConnectRequest):
     uid = req.uid.strip()
