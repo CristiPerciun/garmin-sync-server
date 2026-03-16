@@ -18,11 +18,11 @@ Richiede [flyctl](https://fly.io/docs/hands-on/install-flyctl/) installato e `fl
 
 Il server richiede le credenziali Firebase per scrivere su Firestore.
 
-### Opzione A: Da file locale (PowerShell)
+### Opzione A: Da file (consigliato – evita problemi con caratteri speciali)
 
 ```powershell
 cd C:\Users\c.perciun\Documents\Custom_WorkSpace\garmin-sync-server
-fly secrets set FIREBASE_CREDENTIALS="$(Get-Content firebase-service-account.json -Raw)"
+fly secrets set FIREBASE_CREDENTIALS=@firebase-service-account.json --app garmin-sync-server
 ```
 
 ### Opzione B: Da file locale (Bash/WSL)

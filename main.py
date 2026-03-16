@@ -16,15 +16,30 @@ load_dotenv()
 
 app = FastAPI(title="Garmin Sync - FitAI Analyzer")
 
-# === FIREBASE (uguale al tuo vecchio codice) ===
-firebase_creds = os.getenv("FIREBASE_CREDENTIALS")
-if firebase_creds:
-    cred = credentials.Certificate(json.loads(firebase_creds))
-elif os.path.exists("firebase-service-account.json"):
-    cred = credentials.Certificate("firebase-service-account.json")
-else:
+# === FIREBASE ===
+def _load_firebase_cred():
+    firebase_creds = os.getenv("FIREBASE_CREDENTIALS")
+    if firebase_creds:
+        s = firebase_creds.strip().lstrip("\ufeff")  # strip BOM
+        if not s:
+            logger.error("FIREBASE_CREDENTIALS è vuoto")
+            raise ValueError("FIREBASE_CREDENTIALS vuoto")
+        try:
+            return credentials.Certificate(json.loads(s))
+        except json.JSONDecodeError as e:
+            # Se sembra un path (es. @file su Windows ha passato il path)
+            if os.path.isfile(s.strip('"').strip("'")):
+                path = s.strip('"').strip("'")
+                logger.info(f"Carico credenziali da file: {path}")
+                return credentials.Certificate(path)
+            logger.error(f"FIREBASE_CREDENTIALS non è JSON valido: {e}")
+            raise
+    if os.path.exists("firebase-service-account.json"):
+        return credentials.Certificate("firebase-service-account.json")
     logger.error("Manca firebase-service-account.json o FIREBASE_CREDENTIALS")
-    exit(1)
+    raise ValueError("Configura FIREBASE_CREDENTIALS su Fly: fly secrets set FIREBASE_CREDENTIALS=@firebase-service-account.json")
+
+cred = _load_firebase_cred()
 
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
