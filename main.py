@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import shutil
@@ -103,6 +102,83 @@ def _extract_activities_list(raw) -> list:
     return []
 
 
+def _store_sync_status(
+    uid: str,
+    *,
+    success: bool,
+    message: str | None = None,
+    activities_synced: int = 0,
+    health_days_synced: int = 0,
+):
+    db.collection("users").document(uid).set(
+        {
+            "garmin_last_sync_status": "ok" if success else "error",
+            "garmin_last_sync_at": datetime.utcnow().isoformat(),
+            "garmin_last_sync_error": None if success else (message or "Errore sconosciuto"),
+            "garmin_last_activities_synced": activities_synced,
+            "garmin_last_health_days_synced": health_days_synced,
+        },
+        merge=True,
+    )
+
+
+def _sync_vitals_for_client(
+    client: Garmin,
+    uid: str,
+    *,
+    num_days: int = 2,
+    activities_limit: int = 50,
+):
+    """Sync leggera usata al login e nel pull-to-refresh."""
+    health_days = _sync_daily_health(client, uid, num_days=num_days)
+    raw_activities = client.get_activities(0, activities_limit)
+    activities = _extract_activities_list(raw_activities)
+    by_date: dict[str, list[dict]] = {}
+
+    for act in activities:
+        act_id = act.get("activityId") or act.get("activityID")
+        if not act_id:
+            continue
+        start_raw = act.get("startTimeGMT") or act.get("startTime") or act.get("startTimeLocal") or ""
+        dt = _parse_datetime(start_raw) or datetime.utcnow()
+        date_key = _date_key(dt)
+        by_date.setdefault(date_key, []).append(act)
+
+    for date_key, garmin_acts in by_date.items():
+        existing_docs = _load_existing_activities_for_date(uid, date_key)
+        for act in garmin_acts:
+            start_raw = act.get("startTimeGMT") or act.get("startTime") or act.get("startTimeLocal") or ""
+            start_dt = _parse_datetime(start_raw) or datetime.utcnow()
+            incoming_type = _garmin_type_key(act)
+            existing = _find_matching_activity(existing_docs, start_dt, incoming_type)
+            act_id = str(act.get("activityId") or act.get("activityID"))
+            doc_id = existing["id"] if existing else f"garmin_{act_id}"
+            merged = _build_unified_garmin_doc(doc_id, act, start_dt, existing)
+            (
+                db.collection("users")
+                .document(uid)
+                .collection("activities")
+                .document(doc_id)
+                .set(merged, merge=True)
+            )
+            if existing is None:
+                existing_docs.append(merged)
+            else:
+                idx = existing_docs.index(existing)
+                existing_docs[idx] = merged
+        _refresh_daily_log_index(uid, date_key)
+
+    logger.info(
+        f"Sync vitals ok per {uid} ({health_days} giorni health, {len(activities)} attivita)"
+    )
+    return {
+        "success": True,
+        "health_days_synced": health_days,
+        "activities_synced": len(activities),
+        "message": f"Aggiornati {health_days} giorni biometrici e {len(activities)} attivita.",
+    }
+
+
 # === ENDPOINT LOGIN GARMIN (il tasto "Connect Garmin") ===
 @app.post("/garmin/connect")
 async def connect_garmin(req: GarminConnectRequest):
@@ -124,18 +200,33 @@ async def connect_garmin(req: GarminConnectRequest):
             "garmin_last_email": req.email
         }, merge=True)
 
-        # Sync in thread per evitare timeout (sync puo' richiedere 30-60s)
-        sync_result = await asyncio.to_thread(sync_user, uid, client)
+        # Al login facciamo una sync iniziale leggera ma obbligatoria:
+        # se non scrive almeno daily_health/activities, il login non deve risultare "ok".
+        sync_result = _sync_vitals_for_client(client, uid, num_days=2, activities_limit=50)
         synced_activities = sync_result.get("activities_synced", 0)
         health_days = sync_result.get("health_days_synced", 0)
 
         if not sync_result.get("success", False):
+            _store_sync_status(
+                uid,
+                success=False,
+                message=sync_result.get("message"),
+                activities_synced=synced_activities,
+                health_days_synced=health_days,
+            )
             logger.warning(f"Garmin collegato per {uid} ma sync fallita: {sync_result.get('message', '')}")
             return {
-                "success": True,
-                "message": f"Garmin collegato. Sync dati non riuscita: {sync_result.get('message', '')}. Prova pull-to-refresh."
+                "success": False,
+                "message": f"Login Garmin riuscito ma sync iniziale fallita: {sync_result.get('message', '')}",
             }
 
+        _store_sync_status(
+            uid,
+            success=True,
+            message=sync_result.get("message"),
+            activities_synced=synced_activities,
+            health_days_synced=health_days,
+        )
         logger.success(f"✅ Garmin collegato per UID {uid} (attivita: {synced_activities}, health: {health_days} giorni)")
         return {
             "success": True,
@@ -222,46 +313,21 @@ async def sync_vitals(req: GarminSyncRequest):
     try:
         client = Garmin()
         client.login(tokenstore=os.path.abspath(token_subdir))
-        health_days = _sync_daily_health(client, uid, num_days=2)
-        raw_activities = client.get_activities(0, 50)
-        activities = _extract_activities_list(raw_activities)
-        by_date = {}
-        for act in activities:
-            act_id = act.get("activityId") or act.get("activityID")
-            if not act_id:
-                continue
-            start_raw = act.get("startTimeGMT") or act.get("startTime") or act.get("startTimeLocal") or ""
-            dt = _parse_datetime(start_raw) or datetime.utcnow()
-            date_key = _date_key(dt)
-            by_date.setdefault(date_key, []).append(act)
-        for date_key, garmin_acts in by_date.items():
-            existing_docs = _load_existing_activities_for_date(uid, date_key)
-            for act in garmin_acts:
-                start_raw = act.get("startTimeGMT") or act.get("startTime") or act.get("startTimeLocal") or ""
-                start_dt = _parse_datetime(start_raw) or datetime.utcnow()
-                incoming_type = _garmin_type_key(act)
-                existing = _find_matching_activity(existing_docs, start_dt, incoming_type)
-                act_id = str(act.get("activityId") or act.get("activityID"))
-                doc_id = existing["id"] if existing else f"garmin_{act_id}"
-                merged = _build_unified_garmin_doc(doc_id, act, start_dt, existing)
-                db.collection("users").document(uid).collection("activities").document(doc_id).set(merged, merge=True)
-                if existing is None:
-                    existing_docs.append(merged)
-                else:
-                    idx = existing_docs.index(existing)
-                    existing_docs[idx] = merged
-            _refresh_daily_log_index(uid, date_key)
-        logger.info(f"Sync vitals ok per {uid} ({health_days} giorni health, {len(activities)} attivita)")
-        return {
-            "success": True,
-            "health_days_synced": health_days,
-            "activities_synced": len(activities),
-            "message": f"Aggiornati {health_days} giorni biometrici e {len(activities)} attivita."
-        }
+        sync_result = _sync_vitals_for_client(client, uid, num_days=2, activities_limit=50)
+        _store_sync_status(
+            uid,
+            success=True,
+            message=sync_result.get("message"),
+            activities_synced=sync_result.get("activities_synced", 0),
+            health_days_synced=sync_result.get("health_days_synced", 0),
+        )
+        return sync_result
     except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException):
+        _store_sync_status(uid, success=False, message="Sessione Garmin scaduta.")
         logger.warning(f"Sync vitals fallito per {uid} (credenziali scadute)")
         raise HTTPException(status_code=401, detail="Sessione Garmin scaduta. Ricollega l'account.")
     except Exception as e:
+        _store_sync_status(uid, success=False, message=str(e))
         logger.error(f"Sync vitals fallito {uid}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -517,7 +583,6 @@ def sync_user(uid: str, client: Garmin | None = None):
             client = Garmin()
             client.login(tokenstore=os.path.abspath(token_subdir))
 
-        today = datetime.now().strftime("%Y-%m-%d")
         raw_activities = client.get_activities(0, 50)
         activities = _extract_activities_list(raw_activities)
         if not activities:
@@ -562,6 +627,13 @@ def sync_user(uid: str, client: Garmin | None = None):
             _refresh_daily_log_index(uid, date_key)
 
         logger.success(f"Sync ok per {uid} ({len(activities)} attivita, {health_days} giorni health)")
+        _store_sync_status(
+            uid,
+            success=True,
+            message="Sync completata",
+            activities_synced=len(activities),
+            health_days_synced=health_days,
+        )
         return {
             "success": True,
             "activities_synced": len(activities),
@@ -570,6 +642,7 @@ def sync_user(uid: str, client: Garmin | None = None):
         }
     except Exception as e:
         logger.error(f"Sync fallito {uid}: {e}")
+        _store_sync_status(uid, success=False, message=str(e))
         return {
             "success": False,
             "activities_synced": 0,
