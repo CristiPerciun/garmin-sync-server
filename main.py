@@ -93,11 +93,13 @@ async def connect_garmin(req: GarminConnectRequest):
     uid = req.uid.strip()
     token_subdir = os.path.join(TOKENS_DIR, uid)
     os.makedirs(token_subdir, exist_ok=True)
-    os.environ["GARMINTOKENS"] = os.path.abspath(token_subdir)   # <-- importante per il tuo setup
 
     try:
         client = Garmin(req.email, req.password)
-        client.login()   # salva token automaticamente
+        # Importante: al primo login NON passare tokenstore/GARMINTOKENS,
+        # altrimenti la libreria prova a caricare token gia' esistenti.
+        client.login()
+        client.garth.dump(os.path.abspath(token_subdir))
 
         # Marca utente come collegato su Firestore
         db.collection("users").document(uid).set({
@@ -164,11 +166,10 @@ def sync_user(uid: str, client: Garmin | None = None):
             "activities_synced": 0,
             "message": "Account Garmin non collegato. Esegui prima il login Garmin."
         }
-    os.environ["GARMINTOKENS"] = os.path.abspath(token_subdir)
     try:
         if client is None:
-            garth.resume()
-            client = Garmin()   # usa token
+            client = Garmin()
+            client.login(tokenstore=os.path.abspath(token_subdir))
 
         today = datetime.now().strftime("%Y-%m-%d")
         activities = client.get_activities(0, 20)
