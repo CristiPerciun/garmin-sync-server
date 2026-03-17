@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import shutil
@@ -88,6 +89,20 @@ class GarminSyncRequest(BaseModel):
 def health():
     return {"status": "ok", "service": "garmin-sync-server"}
 
+def _extract_activities_list(raw) -> list:
+    """get_activities puo' restituire list o dict con chiave activities/activityList."""
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        out = raw.get("activities") or raw.get("activityList") or []
+        if not out and raw:
+            logger.debug(f"get_activities ha restituito dict con chiavi: {list(raw.keys())}")
+        return out if isinstance(out, list) else []
+    if raw is not None:
+        logger.warning(f"get_activities tipo inatteso: {type(raw)}")
+    return []
+
+
 # === ENDPOINT LOGIN GARMIN (il tasto "Connect Garmin") ===
 @app.post("/garmin/connect")
 async def connect_garmin(req: GarminConnectRequest):
@@ -109,9 +124,18 @@ async def connect_garmin(req: GarminConnectRequest):
             "garmin_last_email": req.email
         }, merge=True)
 
-        sync_result = sync_user(uid, client)
-        synced_activities = sync_result["activities_synced"]
+        # Sync in thread per evitare timeout (sync puo' richiedere 30-60s)
+        sync_result = await asyncio.to_thread(sync_user, uid, client)
+        synced_activities = sync_result.get("activities_synced", 0)
         health_days = sync_result.get("health_days_synced", 0)
+
+        if not sync_result.get("success", False):
+            logger.warning(f"Garmin collegato per {uid} ma sync fallita: {sync_result.get('message', '')}")
+            return {
+                "success": True,
+                "message": f"Garmin collegato. Sync dati non riuscita: {sync_result.get('message', '')}. Prova pull-to-refresh."
+            }
+
         logger.success(f"✅ Garmin collegato per UID {uid} (attivita: {synced_activities}, health: {health_days} giorni)")
         return {
             "success": True,
@@ -199,9 +223,8 @@ async def sync_vitals(req: GarminSyncRequest):
         client = Garmin()
         client.login(tokenstore=os.path.abspath(token_subdir))
         health_days = _sync_daily_health(client, uid, num_days=2)
-        activities = client.get_activities(0, 20)
-        if not isinstance(activities, list):
-            activities = []
+        raw_activities = client.get_activities(0, 50)
+        activities = _extract_activities_list(raw_activities)
         by_date = {}
         for act in activities:
             act_id = act.get("activityId") or act.get("activityID")
@@ -495,9 +518,10 @@ def sync_user(uid: str, client: Garmin | None = None):
             client.login(tokenstore=os.path.abspath(token_subdir))
 
         today = datetime.now().strftime("%Y-%m-%d")
-        activities = client.get_activities(0, 20)
-        if not isinstance(activities, list):
-            activities = []
+        raw_activities = client.get_activities(0, 50)
+        activities = _extract_activities_list(raw_activities)
+        if not activities:
+            logger.info(f"sync_user {uid}: get_activities ha restituito {len(activities)} attivita (raw type: {type(raw_activities).__name__})")
 
         # 1. daily_health: passi, sonno, HRV, Body Battery (get_stats, get_sleep_data, get_hrv_data, get_body_battery)
         health_days = _sync_daily_health(client, uid)
