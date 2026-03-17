@@ -214,10 +214,153 @@ async def sync_vitals(req: GarminSyncRequest):
 
 # === SYNC DAILY HEALTH (passi, sonno, HRV, Body Battery) ===
 DAILY_HEALTH_SYNC_DAYS = 14  # Ultimi N giorni da sincronizzare (sync full)
+ACTIVITY_MERGE_WINDOW_MINUTES = 2
+
+def _date_key(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+def _parse_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def _normalize_activity_type(raw_type):
+    value = str(raw_type or "").strip().lower()
+    if value == "running":
+        return "run"
+    if value in ("cycling", "bike"):
+        return "ride"
+    if value in ("walking", "hiking"):
+        return "walk"
+    return value
+
+def _same_activity_type(left: str, right: str) -> bool:
+    if not left or not right:
+        return True
+    run_like = {"run", "running", "trailrun"}
+    ride_like = {"ride", "cycling", "bike", "virtualride"}
+    walk_like = {"walk", "walking", "hike", "hiking"}
+    if left in run_like and right in run_like:
+        return True
+    if left in ride_like and right in ride_like:
+        return True
+    if left in walk_like and right in walk_like:
+        return True
+    return left == right
+
+def _garmin_type_key(act: dict) -> str:
+    act_type = act.get("activityType")
+    if isinstance(act_type, dict):
+        return str(act_type.get("typeKey") or act_type.get("typeId") or "")
+    return str(act_type or "")
+
+def _existing_has_strava(data: dict | None) -> bool:
+    if not data:
+        return False
+    return bool(
+        data.get("hasStrava")
+        or data.get("source") in ("strava", "dual")
+        or data.get("strava_raw")
+        or data.get("stravaActivityId")
+    )
+
+def _load_existing_activities_for_date(uid: str, date_key: str) -> list[dict]:
+    snapshot = (
+        db.collection("users")
+        .document(uid)
+        .collection("activities")
+        .where("dateKey", "==", date_key)
+        .stream()
+    )
+    return [{"id": doc.id, **doc.to_dict()} for doc in snapshot]
+
+def _find_matching_activity(existing_docs: list[dict], start_dt: datetime, incoming_type: str):
+    normalized_type = _normalize_activity_type(incoming_type)
+    for doc in existing_docs:
+        candidate_start = _parse_datetime(doc.get("startTime")) or _parse_datetime(doc.get("date"))
+        if candidate_start is None:
+            continue
+        if abs((candidate_start - start_dt).total_seconds()) > ACTIVITY_MERGE_WINDOW_MINUTES * 60:
+            continue
+        candidate_type = _normalize_activity_type(doc.get("activityType"))
+        if _same_activity_type(candidate_type, normalized_type):
+            return doc
+    return None
+
+def _build_unified_garmin_doc(doc_id: str, act: dict, start_dt: datetime, existing: dict | None = None) -> dict:
+    act_id = str(act.get("activityId") or act.get("activityID") or "")
+    type_key = _garmin_type_key(act)
+    duration_sec = (
+        (act.get("duration") or act.get("movingDuration") or 0)
+        if isinstance(act.get("duration") or act.get("movingDuration") or 0, (int, float))
+        else 0
+    )
+    distance_raw = act.get("distance")
+    distance_val = float(distance_raw) if isinstance(distance_raw, (int, float)) else 0.0
+    distance_km = distance_val / 1000 if distance_val > 100 else distance_val
+    has_strava = _existing_has_strava(existing)
+    strava_raw = existing.get("strava_raw") if existing else None
+
+    return {
+        "id": doc_id,
+        "source": "dual" if has_strava else "garmin",
+        "date": start_dt,
+        "startTime": start_dt,
+        "dateKey": _date_key(start_dt),
+        "calories": float(act["calories"]) if isinstance(act.get("calories"), (int, float)) else None,
+        "distanceKm": distance_km if distance_km > 0 else None,
+        "activeMinutes": (duration_sec / 60.0) if duration_sec else None,
+        "activityType": type_key or str(act.get("activityType") or ""),
+        "activityName": act.get("activityName"),
+        "deviceName": act.get("deviceName"),
+        "elevationGainM": float(act["elevationGain"]) if isinstance(act.get("elevationGain"), (int, float)) else None,
+        "avgHeartrate": float(act["averageHR"]) if isinstance(act.get("averageHR"), (int, float)) else None,
+        "maxHeartrate": float(act["maxHR"]) if isinstance(act.get("maxHR"), (int, float)) else None,
+        "elapsedMinutes": (duration_sec / 60.0) if duration_sec else None,
+        "hasGarmin": True,
+        "hasStrava": has_strava,
+        "garminActivityId": act_id or None,
+        "stravaActivityId": str(existing.get("stravaActivityId")) if existing and existing.get("stravaActivityId") is not None else None,
+        "garmin_raw": act,
+        "strava_raw": strava_raw,
+        "raw": strava_raw if has_strava else act,
+        "syncedAt": datetime.utcnow(),
+    }
+
+def _refresh_daily_log_index(uid: str, date_key: str):
+    activities = _load_existing_activities_for_date(uid, date_key)
+    total_burned = 0.0
+    activity_ids: list[str] = []
+    for activity in activities:
+        activity_ids.append(activity["id"])
+        calories = activity.get("calories")
+        if isinstance(calories, (int, float)):
+            total_burned += float(calories)
+    activity_ids.sort()
+    (
+        db.collection("users")
+        .document(uid)
+        .collection("daily_logs")
+        .document(date_key)
+        .set(
+            {
+                "date": date_key,
+                "activity_ids": activity_ids,
+                "health_ref": date_key,
+                "total_burned_kcal": total_burned,
+                "timestamp": datetime.utcnow(),
+            },
+            merge=True,
+        )
+    )
 
 def _sync_daily_health(client: Garmin, uid: str, num_days: int | None = None) -> int:
     """Estrae dati biometrici giornalieri e salva in daily_health/{date}. Ritorna numero giorni sincronizzati."""
-    prefix = f"users/{uid}/daily_health"
     today = datetime.now().date()
     days = num_days if num_days is not None else DAILY_HEALTH_SYNC_DAYS
     synced_count = 0
@@ -279,7 +422,27 @@ def _sync_daily_health(client: Garmin, uid: str, num_days: int | None = None) ->
 
         # Salva solo se abbiamo almeno un dato oltre date/syncedAt
         if len(doc_data) > 2:
-            db.collection(prefix).document(date_str).set(doc_data, merge=True)
+            (
+                db.collection("users")
+                .document(uid)
+                .collection("daily_health")
+                .document(date_str)
+                .set(doc_data, merge=True)
+            )
+            (
+                db.collection("users")
+                .document(uid)
+                .collection("daily_logs")
+                .document(date_str)
+                .set(
+                    {
+                        "date": date_str,
+                        "health_ref": date_str,
+                        "timestamp": datetime.utcnow(),
+                    },
+                    merge=True,
+                )
+            )
             synced_count += 1
 
         time.sleep(0.5)  # rate-limit API Garmin
@@ -306,70 +469,43 @@ def sync_user(uid: str, client: Garmin | None = None):
         if not isinstance(activities, list):
             activities = []
 
-        prefix = f"users/{uid}"
-        batch = db.batch()
-
-        # 1. Salva in garmin_activities (merge - evita duplicati per activityId)
-        for act in activities:
-            act_id = act.get("activityId") or act.get("activityID")
-            if not act_id:
-                continue
-            start_raw = act.get("startTimeGMT") or act.get("startTime") or act.get("startTimeLocal") or ""
-            try:
-                dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00")) if start_raw else datetime.utcnow()
-            except Exception:
-                dt = datetime.utcnow()
-            date_key = dt.strftime("%Y-%m-%d")
-            act_type = act.get("activityType")
-            type_key = act_type.get("typeKey", "") if isinstance(act_type, dict) else str(act_type or "")
-            doc_data = {
-                **act,
-                "syncedAt": datetime.utcnow().isoformat(),
-                "startTime": start_raw or act.get("startTimeGMT"),
-                "dateKey": date_key,
-                "activityTypeKey": type_key,
-                "source": "garmin",
-            }
-            doc_ref = db.collection(f"{prefix}/garmin_activities").document(str(act_id))
-            batch.set(doc_ref, doc_data, merge=True)
-
-        # 2. garmin_daily (Livello 1 - daily stats)
-        daily_ref = db.collection(f"{prefix}/garmin_daily").document(today)
-        batch.set(daily_ref, {"date": today, "syncedAt": datetime.utcnow().isoformat()}, merge=True)
-        batch.commit()
-
-        # 2b. daily_health: passi, sonno, HRV, Body Battery (get_stats, get_sleep_data, get_hrv_data, get_body_battery)
+        # 1. daily_health: passi, sonno, HRV, Body Battery (get_stats, get_sleep_data, get_hrv_data, get_body_battery)
         health_days = _sync_daily_health(client, uid)
 
-        # 3. daily_logs (Livello 1): SOLO garmin_activities. merge=True: NON toccare strava_activities.
-        #    Strava scrive da app Flutter (StravaService), Garmin scrive da questo server.
+        # 2. activities + daily_logs.activity_ids (indice unificato)
         by_date: dict[str, list[dict]] = {}
         for act in activities:
             act_id = act.get("activityId") or act.get("activityID")
             if not act_id:
                 continue
             start_raw = act.get("startTimeGMT") or act.get("startTime") or act.get("startTimeLocal") or ""
-            try:
-                dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00")) if start_raw else datetime.utcnow()
-            except Exception:
-                dt = datetime.utcnow()
-            date_key = dt.strftime("%Y-%m-%d")
+            dt = _parse_datetime(start_raw) or datetime.utcnow()
+            date_key = _date_key(dt)
             by_date.setdefault(date_key, []).append(act)
 
         for date_key, garmin_acts in by_date.items():
-            daily_log_ref = db.collection(f"{prefix}/daily_logs").document(date_key)
-            # Formato Garmin nativo + campi normalizzati per query/deduplicazione
-            garmin_for_log = []
-            for a in garmin_acts:
-                at = a.get("activityType")
-                tk = at.get("typeKey", "") if isinstance(at, dict) else str(at or "")
-                garmin_for_log.append({**a, "source": "garmin", "dateKey": date_key, "activityTypeKey": tk})
-            update = {
-                "date": date_key,
-                "garmin_activities": garmin_for_log,
-                "timestamp": datetime.utcnow(),
-            }
-            daily_log_ref.set(update, merge=True)
+            existing_docs = _load_existing_activities_for_date(uid, date_key)
+            for act in garmin_acts:
+                start_raw = act.get("startTimeGMT") or act.get("startTime") or act.get("startTimeLocal") or ""
+                start_dt = _parse_datetime(start_raw) or datetime.utcnow()
+                incoming_type = _garmin_type_key(act)
+                existing = _find_matching_activity(existing_docs, start_dt, incoming_type)
+                act_id = str(act.get("activityId") or act.get("activityID"))
+                doc_id = existing["id"] if existing else f"garmin_{act_id}"
+                merged = _build_unified_garmin_doc(doc_id, act, start_dt, existing)
+                (
+                    db.collection("users")
+                    .document(uid)
+                    .collection("activities")
+                    .document(doc_id)
+                    .set(merged, merge=True)
+                )
+                if existing is None:
+                    existing_docs.append(merged)
+                else:
+                    idx = existing_docs.index(existing)
+                    existing_docs[idx] = merged
+            _refresh_daily_log_index(uid, date_key)
 
         logger.success(f"Sync ok per {uid} ({len(activities)} attivita, {health_days} giorni health)")
         return {
