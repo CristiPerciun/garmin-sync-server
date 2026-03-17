@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -158,6 +159,33 @@ async def sync_garmin(req: GarminSyncRequest):
         "success": True,
         "message": f"Sync Garmin completata. Sincronizzate {sync_result['activities_synced']} attivita, {health_days} giorni di dati biometrici."
     }
+
+# === ENDPOINT DISCONNECT (scollega account Garmin) ===
+@app.post("/garmin/disconnect")
+async def disconnect_garmin(req: GarminSyncRequest):
+    """Elimina i token Garmin e marca l'utente come scollegato su Firestore."""
+    uid = req.uid.strip()
+    token_subdir = os.path.join(TOKENS_DIR, uid)
+
+    try:
+        # 1. Elimina la cartella token (sessione chiusa)
+        if os.path.isdir(token_subdir):
+            shutil.rmtree(token_subdir)
+            logger.info(f"Token Garmin eliminati per {uid}")
+
+        # 2. Aggiorna Firestore: garmin_linked = False
+        db.collection("users").document(uid).set({
+            "garmin_linked": False,
+            "garmin_disconnected_at": datetime.utcnow().isoformat(),
+        }, merge=True)
+
+        return {
+            "success": True,
+            "message": "Account Garmin scollegato correttamente.",
+        }
+    except Exception as e:
+        logger.error(f"Disconnect fallito {uid}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # === ENDPOINT SYNC VITALS (pull-to-refresh: solo oggi e ieri) ===
 @app.post("/garmin/sync-vitals")
