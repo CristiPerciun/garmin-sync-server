@@ -378,6 +378,27 @@ def _garmin_type_key(act: dict) -> str:
         return str(act_type.get("typeKey") or act_type.get("typeId") or "")
     return str(act_type or "")
 
+def _firestore_safe_raw(obj: dict | None, max_depth: int = 3) -> dict | None:
+    """Estrae un subset Firestore-safe da raw (niente array di oggetti, nesting limitato)."""
+    if not obj or not isinstance(obj, dict):
+        return None
+    out = {}
+    for k, v in obj.items():
+        if v is None or isinstance(v, (str, int, float, bool)):
+            out[k] = v
+        elif isinstance(v, dict) and max_depth > 0:
+            nested = _firestore_safe_raw(v, max_depth - 1)
+            if nested is not None:
+                out[k] = nested
+        elif isinstance(v, list):
+            # Firestore: array di oggetti non consentito. Solo primitivi.
+            safe = [x for x in v if x is None or isinstance(x, (str, int, float, bool))]
+            if len(safe) == len(v):
+                out[k] = safe
+            # altrimenti salta l'array (es. samples GPS)
+    return out if out else None
+
+
 def _existing_has_strava(data: dict | None) -> bool:
     if not data:
         return False
@@ -445,9 +466,9 @@ def _build_unified_garmin_doc(doc_id: str, act: dict, start_dt: datetime, existi
         "hasStrava": has_strava,
         "garminActivityId": act_id or None,
         "stravaActivityId": str(existing.get("stravaActivityId")) if existing and existing.get("stravaActivityId") is not None else None,
-        "garmin_raw": act,
-        "strava_raw": strava_raw,
-        "raw": strava_raw if has_strava else act,
+        "garmin_raw": _firestore_safe_raw(act),
+        "strava_raw": _firestore_safe_raw(strava_raw) if strava_raw else None,
+        "raw": _firestore_safe_raw(strava_raw if has_strava else act),
         "syncedAt": datetime.utcnow(),
     }
 
@@ -540,14 +561,28 @@ def _sync_daily_health(client: Garmin, uid: str, num_days: int | None = None) ->
             logger.debug(f"get_fitnessage_data {date_str} non disponibile: {e}")
 
         # Salva solo se abbiamo almeno un dato oltre date/syncedAt
+        # Sanitizza per Firestore: niente array di oggetti (Firestore li rifiuta)
         if len(doc_data) > 2:
-            (
-                db.collection("users")
-                .document(uid)
-                .collection("daily_health")
-                .document(date_str)
-                .set(doc_data, merge=True)
-            )
+            safe_data = {}
+            for k, v in doc_data.items():
+                if v is None or isinstance(v, (str, int, float, bool)):
+                    safe_data[k] = v
+                elif isinstance(v, dict):
+                    s = _firestore_safe_raw(v, max_depth=5)
+                    if s:
+                        safe_data[k] = s
+                elif isinstance(v, list):
+                    if all(x is None or isinstance(x, (str, int, float, bool)) for x in v):
+                        safe_data[k] = v
+                    # array di oggetti non consentito da Firestore: salta
+            if len(safe_data) > 2:
+                (
+                    db.collection("users")
+                    .document(uid)
+                    .collection("daily_health")
+                    .document(date_str)
+                    .set(safe_data, merge=True)
+                )
             (
                 db.collection("users")
                 .document(uid)
