@@ -25,13 +25,44 @@ except ImportError:
     GarthHTTPError = _DummyGarthException
 from apscheduler.schedulers.background import BackgroundScheduler
 from loguru import logger
-from fastapi import FastAPI, HTTPException
+import threading
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 load_dotenv()
 
-app = FastAPI(title="Garmin Sync - FitAI Analyzer")
+scheduler = BackgroundScheduler()
+
+
+def _run_scheduled_sync():
+    """Esegue sync per tutti gli utenti garmin_linked. Usato da scheduler e endpoint."""
+    try:
+        scheduled_sync()
+    except Exception as e:
+        logger.error(f"Scheduled sync fallito: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Avvia scheduler e prima sync al bootstrap (Fly.io: machine si sveglia su richiesta)."""
+    scheduler.add_job(_run_scheduled_sync, "interval", minutes=45, id="garmin_sync")
+    scheduler.start()
+    logger.info("⏰ Scheduler avviato: sync ogni 45 min per utenti garmin_linked")
+
+    def run_after_delay():
+        time.sleep(120)  # 2 min per dare tempo al server di essere pronto
+        _run_scheduled_sync()
+
+    threading.Thread(target=run_after_delay, daemon=True).start()
+    logger.info("📅 Prima sync programmata tra 2 minuti")
+    yield
+    scheduler.shutdown(wait=False)
+
+
+app = FastAPI(title="Garmin Sync - FitAI Analyzer", lifespan=lifespan)
 
 # CORS: permette richieste da FitAI Analyzer (web/mobile)
 app.add_middleware(
@@ -67,10 +98,16 @@ def _load_firebase_cred():
             return credentials.Certificate(json.loads(decoded))
         except Exception as e:
             logger.error(f"FIREBASE_CREDENTIALS_B64 non valido: {e}")
-            raise ValueError("FIREBASE_CREDENTIALS_B64 non valido. Riesegui .\\set-firebase-secret.ps1")
+            raise ValueError(
+                "FIREBASE_CREDENTIALS_B64 non valido. Verifica che sia Base64 del JSON "
+                "firebase-service-account.json. Vedi RENDER_DEPLOY.md."
+            )
 
     logger.error("Manca FIREBASE_CREDENTIALS o FIREBASE_CREDENTIALS_B64")
-    raise ValueError("Esegui: .\\set-firebase-secret.ps1")
+    raise ValueError(
+        "Configura FIREBASE_CREDENTIALS_B64 (o FIREBASE_CREDENTIALS) come variabile d'ambiente. "
+        "Vedi RENDER_DEPLOY.md per Render, oppure .\\set-firebase-secret.ps1 per Fly.io."
+    )
 
 cred = _load_firebase_cred()
 
@@ -702,21 +739,44 @@ def sync_user(uid: str, client: Garmin | None = None):
 
 # === SCHEDULER (multi-utente) ===
 def scheduled_sync():
-    logger.info("Inizio sync batch...")
-    users = db.collection("users").where("garmin_linked", "==", True).stream()
+    """Sync Garmin per tutti gli utenti con garmin_linked=True."""
+    logger.info("Inizio sync batch (utenti garmin_linked)...")
+    users = list(db.collection("users").where("garmin_linked", "==", True).stream())
+    if not users:
+        logger.info("Nessun utente garmin_linked, sync batch saltata")
+        return
     for user in users:
-        sync_user(user.id)
-        time.sleep(10)   # rate-limit Garmin
+        try:
+            result = sync_user(user.id)
+            if result.get("success"):
+                logger.info(f"  ✓ {user.id[:8]}... ok")
+            else:
+                logger.warning(f"  ✗ {user.id[:8]}... {result.get('message', '')}")
+        except Exception as e:
+            logger.error(f"  ✗ {user.id[:8]}... {e}")
+        time.sleep(10)  # rate-limit API Garmin
+    logger.info(f"Sync batch completato ({len(users)} utenti)")
+
+
+# === ENDPOINT PER CRON ESTERNO (Fly.io: min_machines=0 spegne la macchina, cron la sveglia) ===
+@app.post("/internal/scheduled-sync")
+async def trigger_scheduled_sync(x_cron_secret: str | None = Header(default=None)):
+    """
+    Chiamato da cron esterno (es. cron-job.org ogni 45 min).
+    Richiede header X-Cron-Secret = CRON_SECRET (env).
+    Sveglia la macchina Fly e esegue sync per tutti gli utenti garmin_linked.
+    """
+    secret = os.getenv("CRON_SECRET")
+    if secret and x_cron_secret != secret:
+        raise HTTPException(status_code=403, detail="Secret non valido")
+    logger.info("📥 scheduled-sync richiesto via endpoint (cron esterno)")
+    _run_scheduled_sync()
+    return {"success": True, "message": "Sync batch eseguito"}
+
 
 # === AVVIO (compatibile Fly.io) ===
 if __name__ == "__main__":
-    logger.info("🚀 Server avviato con API + sync")
-
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(scheduled_sync, "interval", minutes=45)
-    scheduler.start()
-
-    # Health check + API: Fly.io usa internal_port 8080, imposta PORT=8080
+    logger.info("🚀 Server avviato con API + scheduler sync ogni 45 min")
     port = int(os.getenv("PORT", "8080"))
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)

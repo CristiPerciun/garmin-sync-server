@@ -87,6 +87,32 @@ Con `auto_stop_machines = 'stop'`, la prima richiesta dopo inattività può rich
 
 ---
 
+## 4. Sync automatica ogni 45 min (utenti garmin_linked)
+
+Con `min_machines_running = 0`, la macchina si **spegne** quando inattiva. Lo scheduler interno non gira quando la macchina è spenta.
+
+**Soluzioni:**
+
+### A) Cron esterno (consigliato, gratuito)
+
+Usa [cron-job.org](https://cron-job.org) o simile per chiamare ogni 45 min:
+
+```
+POST https://garmin-sync-server.fly.dev/internal/scheduled-sync
+Header: X-Cron-Secret: <CRON_SECRET>
+```
+
+1. Crea un secret su Fly: `fly secrets set CRON_SECRET=una_stringa_segreta --app garmin-sync-server`
+2. Su cron-job.org: crea cron ogni 45 min, URL come sopra, header `X-Cron-Secret: <stesso_valore>`
+
+La richiesta sveglia la macchina e avvia la sync per tutti gli utenti `garmin_linked`.
+
+### B) Macchina sempre attiva (a pagamento)
+
+In `fly.toml` imposta `min_machines_running = 1`. Lo scheduler interno gira ogni 45 min. Costo ~$5-7/mese.
+
+---
+
 ## Ordine consigliato
 
 1. `fly auth login` (se non già autenticato)
