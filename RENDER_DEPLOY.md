@@ -58,16 +58,31 @@ const String garminServerUrl = 'https://<tuo-servizio>.onrender.com';
 
 ---
 
-## 4. Volume persistente (token Garmin)
+## 4. Volume persistente (token Garmin) – **IMPORTANTE**
 
-Render supporta **Disks** per dati persistenti. Se usi un disco:
+**Senza disco, i token Garmin si perdono ad ogni redeploy.** Gli utenti dovranno ricollegare l'account dopo ogni deploy.
 
-- **Mount Path:** `/app/tokens` (o `GARMINTOKENS_ROOT` se diverso)
-- Senza disco, i token Garmin si perdono ad ogni redeploy (gli utenti dovranno ricollegare l'account).
+Per persistenza su Render:
+
+1. **Settings** → **Disks** → **Add Disk**
+2. **Name:** `garmin_tokens`
+3. **Mount Path:** `/app/tokens`
+4. **Size:** 1 GB (sufficiente)
+
+La variabile `GARMINTOKENS_ROOT` (o `TOKENS_DIR` nel codice) usa `/app/tokens` per default.
 
 ---
 
-## 5. Verifica
+## 5. Rate limit Garmin (429)
+
+Garmin Connect limita i tentativi di login. Se vedi **429 Too Many Requests**:
+- Attendi **15-30 minuti** prima di riprovare
+- Non fare più tentativi ravvicinati
+- Il server ora restituisce un messaggio chiaro: "Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova."
+
+---
+
+## 6. Verifica
 
 - **Logs** su Render: dovresti vedere `🚀 Server avviato con API + scheduler sync ogni 45 min`
 - **Health check:** `GET https://<tuo-servizio>.onrender.com/` → `{"status":"ok","service":"garmin-sync-server"}`

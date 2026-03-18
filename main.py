@@ -290,6 +290,12 @@ async def connect_garmin(req: GarminConnectRequest):
         if status in (401, 403):
             logger.warning(f"Login fallito per {uid} (HTTP {status})")
             raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
+        if status == 429:
+            logger.warning(f"Login fallito per {uid}: rate limit Garmin (429)")
+            raise HTTPException(
+                status_code=429,
+                detail="Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
+            )
         logger.error(f"Errore HTTP Garmin {uid}: {status} - {e}")
         raise HTTPException(status_code=500, detail="Errore interno del server")
     except Exception as e:
@@ -301,7 +307,14 @@ async def connect_garmin(req: GarminConnectRequest):
                 msgs.append(str(exc.__context__))
             return " ".join(msgs).lower()
         err_msg = _all_messages(e)
-        auth_keywords = ("401", "unauthorized", "authentication", "login", "invalid", "credential", "password", "forbidden", "403", "client error")
+        # 429: rate limit - NON confondere con credenziali errate
+        if "429" in err_msg or "too many requests" in err_msg:
+            logger.warning(f"Login fallito per {uid}: rate limit Garmin")
+            raise HTTPException(
+                status_code=429,
+                detail="Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
+            )
+        auth_keywords = ("401", "unauthorized", "authentication", "login", "invalid", "credential", "password", "forbidden", "403")
         if any(kw in err_msg for kw in auth_keywords):
             logger.warning(f"Login fallito per {uid}: {e}")
             raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
