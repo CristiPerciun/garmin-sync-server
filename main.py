@@ -26,11 +26,21 @@ except ImportError:
 from apscheduler.schedulers.background import BackgroundScheduler
 from loguru import logger
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 load_dotenv()
 
 app = FastAPI(title="Garmin Sync - FitAI Analyzer")
+
+# CORS: permette richieste da FitAI Analyzer (web/mobile)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # === FIREBASE (secret - mai nel Docker image) ===
@@ -129,8 +139,10 @@ def _sync_vitals_for_client(
     num_days: int = 2,
     activities_limit: int = 50,
 ):
-    """Sync leggera usata al login e nel pull-to-refresh."""
+    """Sync leggera usata al login e nel pull-to-refresh. Chiama API Garmin Connect."""
+    logger.debug(f"sync_vitals: chiamata get_stats/get_sleep_data per {num_days} giorni...")
     health_days = _sync_daily_health(client, uid, num_days=num_days)
+    logger.debug(f"sync_vitals: chiamata get_activities(0, {activities_limit})...")
     raw_activities = client.get_activities(0, activities_limit)
     activities = _extract_activities_list(raw_activities)
     by_date: dict[str, list[dict]] = {}
@@ -307,12 +319,15 @@ async def disconnect_garmin(req: GarminSyncRequest):
 async def sync_vitals(req: GarminSyncRequest):
     """Biometrici oggi+ieri + attivita (ultime 20). Usato per pull-to-refresh e post-login."""
     uid = req.uid.strip()
+    logger.info(f"📥 sync-vitals richiesta ricevuta per uid={uid[:8]}...")
     token_subdir = os.path.join(TOKENS_DIR, uid)
     if not os.path.isdir(token_subdir):
+        logger.warning(f"sync-vitals: token non trovato per {uid[:8]}...")
         raise HTTPException(status_code=404, detail="Account Garmin non collegato. Esegui prima il login Garmin.")
     try:
         client = Garmin()
         client.login(tokenstore=os.path.abspath(token_subdir))
+        logger.info(f"🔗 Connesso a Garmin Connect per {uid[:8]}..., avvio sync...")
         sync_result = _sync_vitals_for_client(client, uid, num_days=2, activities_limit=50)
         _store_sync_status(
             uid,
