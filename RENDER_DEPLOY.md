@@ -58,18 +58,9 @@ const String garminServerUrl = 'https://<tuo-servizio>.onrender.com';
 
 ---
 
-## 4. Volume persistente (token Garmin) – **IMPORTANTE**
+## 4. Token Garmin su Firestore (nessun disco richiesto)
 
-**Senza disco, i token Garmin si perdono ad ogni redeploy.** Gli utenti dovranno ricollegare l'account dopo ogni deploy.
-
-Per persistenza su Render:
-
-1. **Settings** → **Disks** → **Add Disk**
-2. **Name:** `garmin_tokens`
-3. **Mount Path:** `/app/tokens`
-4. **Size:** 1 GB (sufficiente)
-
-La variabile `GARMINTOKENS_ROOT` (o `TOKENS_DIR` nel codice) usa `/app/tokens` per default.
+I token Garmin sono salvati su Firestore nella collection `garmin_tokens/{uid}` (campo `token_b64`, Base64). Non serve disco persistente su Render.
 
 ---
 

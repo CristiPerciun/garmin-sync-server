@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -117,9 +116,28 @@ db = firestore.client()
 
 logger.add(os.path.join(BASE_DIR, "garmin.log"), rotation="10 MB", level="INFO")
 
-# Usa sempre un path assoluto: su Fly il volume e' montato in /app/tokens.
-TOKENS_DIR = os.getenv("GARMINTOKENS_ROOT", os.path.join(BASE_DIR, "tokens"))
-os.makedirs(TOKENS_DIR, exist_ok=True)
+# === HELPER: token Garmin su Firestore (collection garmin_tokens/{uid}, campo token_b64) ===
+# Collection separata per evitare che il client legga i token (regole Firestore negano accesso).
+# Validita token Garmin: ~1 anno. Se non valido, viene rimosso e l'utente deve ricollegare.
+GARMIN_TOKENS_COLLECTION = "garmin_tokens"
+
+def _get_garmin_token_from_firestore(uid: str) -> str | None:
+    """Legge token Garmin (Base64) da Firestore. Ritorna None se assente."""
+    doc = db.collection(GARMIN_TOKENS_COLLECTION).document(uid).get()
+    data = doc.to_dict() or {}
+    token = data.get("token_b64")
+    return str(token).strip() if token else None
+
+def _save_garmin_token_to_firestore(uid: str, token_b64: str) -> None:
+    """Salva token Garmin (Base64) su Firestore. Validita ~1 anno; se scaduto, va rimosso e utente ricollega."""
+    db.collection(GARMIN_TOKENS_COLLECTION).document(uid).set(
+        {"token_b64": token_b64, "updated_at": datetime.utcnow().isoformat()},
+        merge=True,
+    )
+
+def _delete_garmin_token_from_firestore(uid: str) -> None:
+    """Rimuove token Garmin da Firestore (disconnect)."""
+    db.collection(GARMIN_TOKENS_COLLECTION).document(uid).delete()
 
 # === MODELLO PER IL LOGIN DALL'APP ===
 class GarminConnectRequest(BaseModel):
@@ -232,15 +250,13 @@ def _sync_vitals_for_client(
 @app.post("/garmin/connect")
 async def connect_garmin(req: GarminConnectRequest):
     uid = req.uid.strip()
-    token_subdir = os.path.join(TOKENS_DIR, uid)
-    os.makedirs(token_subdir, exist_ok=True)
 
     try:
         client = Garmin(req.email, req.password)
-        # Importante: al primo login NON passare tokenstore/GARMINTOKENS,
-        # altrimenti la libreria prova a caricare token gia' esistenti.
+        # Importante: al primo login NON passare tokenstore, altrimenti la libreria prova a caricare token esistenti.
         client.login()
-        client.garth.dump(os.path.abspath(token_subdir))
+        token_b64 = client.garth.dumps()
+        _save_garmin_token_to_firestore(uid, token_b64)
 
         # Marca utente come collegato su Firestore
         db.collection("users").document(uid).set({
@@ -276,6 +292,11 @@ async def connect_garmin(req: GarminConnectRequest):
             activities_synced=synced_activities,
             health_days_synced=health_days,
         )
+        # Aggiorna token su Firestore (garth puo' aver fatto refresh durante la sync)
+        try:
+            _save_garmin_token_to_firestore(uid, client.garth.dumps())
+        except Exception:
+            pass
         logger.success(f"✅ Garmin collegato per UID {uid} (attivita: {synced_activities}, health: {health_days} giorni)")
         return {
             "success": True,
@@ -340,15 +361,12 @@ async def sync_garmin(req: GarminSyncRequest):
 # === ENDPOINT DISCONNECT (scollega account Garmin) ===
 @app.post("/garmin/disconnect")
 async def disconnect_garmin(req: GarminSyncRequest):
-    """Elimina i token Garmin e marca l'utente come scollegato su Firestore."""
+    """Elimina i token Garmin da Firestore e marca l'utente come scollegato."""
     uid = req.uid.strip()
-    token_subdir = os.path.join(TOKENS_DIR, uid)
 
     try:
-        # 1. Elimina la cartella token (sessione chiusa)
-        if os.path.isdir(token_subdir):
-            shutil.rmtree(token_subdir)
-            logger.info(f"Token Garmin eliminati per {uid}")
+        _delete_garmin_token_from_firestore(uid)
+        logger.info(f"Token Garmin eliminati per {uid}")
 
         # 2. Aggiorna Firestore: garmin_linked = False
         db.collection("users").document(uid).set({
@@ -370,13 +388,13 @@ async def sync_vitals(req: GarminSyncRequest):
     """Biometrici oggi+ieri + attivita (ultime 20). Usato per pull-to-refresh e post-login."""
     uid = req.uid.strip()
     logger.info(f"📥 sync-vitals richiesta ricevuta per uid={uid[:8]}...")
-    token_subdir = os.path.join(TOKENS_DIR, uid)
-    if not os.path.isdir(token_subdir):
+    token_b64 = _get_garmin_token_from_firestore(uid)
+    if not token_b64:
         logger.warning(f"sync-vitals: token non trovato per {uid[:8]}...")
         raise HTTPException(status_code=404, detail="Account Garmin non collegato. Esegui prima il login Garmin.")
     try:
         client = Garmin()
-        client.login(tokenstore=os.path.abspath(token_subdir))
+        client.login(tokenstore=token_b64)
         logger.info(f"🔗 Connesso a Garmin Connect per {uid[:8]}..., avvio sync...")
         sync_result = _sync_vitals_for_client(client, uid, num_days=2, activities_limit=50)
         _store_sync_status(
@@ -386,10 +404,17 @@ async def sync_vitals(req: GarminSyncRequest):
             activities_synced=sync_result.get("activities_synced", 0),
             health_days_synced=sync_result.get("health_days_synced", 0),
         )
+        # Aggiorna token su Firestore (garth puo' aver fatto refresh)
+        try:
+            _save_garmin_token_to_firestore(uid, client.garth.dumps())
+        except Exception:
+            pass
         return sync_result
-    except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException):
+    except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException, GarthHTTPError):
+        _delete_garmin_token_from_firestore(uid)
+        db.collection("users").document(uid).set({"garmin_linked": False}, merge=True)
         _store_sync_status(uid, success=False, message="Sessione Garmin scaduta.")
-        logger.warning(f"Sync vitals fallito per {uid} (credenziali scadute)")
+        logger.warning(f"Sync vitals fallito per {uid} (token non valido, rimosso)")
         raise HTTPException(status_code=401, detail="Sessione Garmin scaduta. Ricollega l'account.")
     except Exception as e:
         _store_sync_status(uid, success=False, message=str(e))
@@ -668,10 +693,10 @@ def _sync_daily_health(client: Garmin, uid: str, num_days: int | None = None) ->
 
     return synced_count
 
-# === SYNC PER UTENTE (usa client attivo o token salvato) ===
+# === SYNC PER UTENTE (usa client attivo o token da Firestore) ===
 def sync_user(uid: str, client: Garmin | None = None):
-    token_subdir = os.path.join(TOKENS_DIR, uid)
-    if client is None and not os.path.isdir(token_subdir):
+    token_b64 = _get_garmin_token_from_firestore(uid) if client is None else None
+    if client is None and not token_b64:
         return {
             "success": False,
             "activities_synced": 0,
@@ -681,7 +706,7 @@ def sync_user(uid: str, client: Garmin | None = None):
     try:
         if client is None:
             client = Garmin()
-            client.login(tokenstore=os.path.abspath(token_subdir))
+            client.login(tokenstore=token_b64)
 
         raw_activities = client.get_activities(0, 50)
         activities = _extract_activities_list(raw_activities)
@@ -734,11 +759,27 @@ def sync_user(uid: str, client: Garmin | None = None):
             activities_synced=len(activities),
             health_days_synced=health_days,
         )
+        # Aggiorna token su Firestore (garth puo' aver fatto refresh)
+        try:
+            _save_garmin_token_to_firestore(uid, client.garth.dumps())
+        except Exception:
+            pass
         return {
             "success": True,
             "activities_synced": len(activities),
             "health_days_synced": health_days,
             "message": "Sync completata"
+        }
+    except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException, GarthHTTPError) as e:
+        _delete_garmin_token_from_firestore(uid)
+        db.collection("users").document(uid).set({"garmin_linked": False}, merge=True)
+        logger.warning(f"Sync fallito {uid}: token non valido, rimosso - {e}")
+        _store_sync_status(uid, success=False, message="Sessione Garmin scaduta.")
+        return {
+            "success": False,
+            "activities_synced": 0,
+            "health_days_synced": 0,
+            "message": "Sessione Garmin scaduta. Ricollega l'account.",
         }
     except Exception as e:
         logger.error(f"Sync fallito {uid}: {e}")
