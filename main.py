@@ -216,6 +216,24 @@ def _http_exception_for_garmin_auth_error(e: BaseException) -> HTTPException:
     )
 
 
+def _walk_exception_chain(root: BaseException):
+    """Root, __cause__ e __context__ (senza duplicati) — utile se Firestore è wrappata."""
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [root]
+    while stack:
+        exc = stack.pop()
+        if exc is None or id(exc) in seen:
+            continue
+        seen.add(id(exc))
+        yield exc
+        c = getattr(exc, "__cause__", None)
+        x = getattr(exc, "__context__", None)
+        if c is not None:
+            stack.append(c)
+        if x is not None and x is not c:
+            stack.append(x)
+
+
 def _http_exception_if_firestore_error(e: BaseException) -> HTTPException | None:
     """
     Errori Google/Firestore durante salvataggio token o users/{uid} — non sono fallimenti password Garmin.
@@ -226,29 +244,31 @@ def _http_exception_if_firestore_error(e: BaseException) -> HTTPException | None
         PermissionDenied = None  # type: ignore[misc, assignment]
         DeadlineExceeded = None  # type: ignore[misc, assignment]
 
-    if PermissionDenied is not None and isinstance(e, PermissionDenied):
-        return HTTPException(
-            status_code=503,
-            detail=(
-                "Firestore ha rifiutato l'operazione (403 permessi). "
-                "Il login Garmin può essere andato a buon fine, ma il service account sul Pi non può scrivere su Firebase. "
-                "Verifica: stesso progetto Firebase dell'app; in Google Cloud → IAM assegna al service account del JSON "
-                "(FIREBASE_CREDENTIALS_B64) un ruolo con accesso a Firestore, es. «Cloud Datastore User» o «Editor». "
-                f"Dettaglio: {_truncate_http_detail(str(e), 500)}"
-            ),
-        )
-    if DeadlineExceeded is not None and isinstance(e, DeadlineExceeded):
-        return HTTPException(
-            status_code=503,
-            detail=(
-                "Firestore: timeout (504). Rete lenta dal Pi verso Google o servizio sovraccarico — riprova. "
-                f"Dettaglio: {_truncate_http_detail(str(e), 400)}"
-            ),
-        )
+    parts = list(_walk_exception_chain(e))
+    for part in parts:
+        if PermissionDenied is not None and isinstance(part, PermissionDenied):
+            return HTTPException(
+                status_code=503,
+                detail=(
+                    "Firestore ha rifiutato l'operazione (403 permessi). "
+                    "Il login Garmin può essere andato a buon fine, ma il service account sul Pi non può scrivere su Firebase. "
+                    "Verifica: stesso progetto Firebase dell'app; in Google Cloud → IAM assegna al service account del JSON "
+                    "(FIREBASE_CREDENTIALS_B64) un ruolo con accesso a Firestore, es. «Cloud Datastore User» o «Editor». "
+                    f"Dettaglio: {_truncate_http_detail(str(part), 500)}"
+                ),
+            )
+        if DeadlineExceeded is not None and isinstance(part, DeadlineExceeded):
+            return HTTPException(
+                status_code=503,
+                detail=(
+                    "Firestore: timeout (504). Rete lenta dal Pi verso Google o servizio sovraccarico — riprova. "
+                    f"Dettaglio: {_truncate_http_detail(str(part), 400)}"
+                ),
+            )
 
-    tname = type(e).__name__
-    em = str(e).lower()
-    if "permissiondenied" in tname.lower() or "missing or insufficient permissions" in em:
+    combined = " ".join(str(p) for p in parts).lower()
+    tnames = " ".join(type(p).__name__.lower() for p in parts)
+    if "permissiondenied" in tnames or "missing or insufficient permissions" in combined:
         return HTTPException(
             status_code=503,
             detail=(
@@ -256,7 +276,7 @@ def _http_exception_if_firestore_error(e: BaseException) -> HTTPException | None
                 + _truncate_http_detail(str(e), 600)
             ),
         )
-    if "deadlineexceeded" in tname.lower() or "deadline exceeded" in em:
+    if "deadlineexceeded" in tnames or "deadline exceeded" in combined:
         return HTTPException(
             status_code=503,
             detail=(

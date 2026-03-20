@@ -108,6 +108,12 @@ sudo systemctl daemon-reload
 
 Poi rilancia `sudo bash deploy/rpi/install.sh`. **Rischio:** disabilita la verifica SSL solo verso i `trusted-host` indicati nello script; in ufficio conviene installare il certificato CA della proxy sul Pi.
 
+### Garmin Connect: `SSLCertVerificationError` / `self-signed certificate` verso `sso.garmin.com`
+
+Nei log compare come `GarminConnectConnectionError` con catena `SSLCertVerificationError`. Non è la password Garmin: il TLS verso Garmin viene **rotto in mezzo** (proxy aziendale, antivirus che ispeziona HTTPS, captive portal, Pi collegato a una rete che inietta un certificato non firmato da una CA di sistema sul Pi).
+
+**Cosa fare:** far uscire il Raspberry su Internet **senza** SSL inspection (hotspot del telefono, rete domestica senza proxy), oppure installare sul Pi il **certificato root** della CA che firma il certificato mostrato dalla proxy (`/usr/local/share/ca-certificates/` + `sudo update-ca-certificates`). Non disabilitare la verifica SSL nel codice del server salvo debug temporaneo.
+
 ### Download pip interrotto (grpcio ~200MB su ARM)
 
 Se `pip` si ferma a metà scaricamento (rete instabile o sessione SSH corta), sul Pi esegui **in locale** (monitor + tastiera o SSH interattivo):
