@@ -1,0 +1,17 @@
+# Copia su Raspberry come /etc/default/garmin-sync-env (opzionale):
+#   sudo cp deploy/rpi/garmin-sync-env.example /etc/default/garmin-sync-env
+#   sudo nano /etc/default/garmin-sync-env
+#
+# garmin-sync-pull.sh e garmin-sync-pull.service caricano questo file.
+
+# Branch Git da seguire (fork: es. fork-sync). Se omesso, usa il branch attualmente checkout sul Pi.
+# GARMIN_SYNC_GIT_BRANCH=fork-sync
+
+# Path repo se diverso dal default /home/cperciun/garmin-sync-server
+# GARMIN_SYNC_HOME=/home/cperciun/garmin-sync-server
+
+# Utente Linux che possiede il clone (default cperciun)
+# GARMIN_SYNC_GIT_USER=cperciun
+
+# Rete con MITM su PyPI (solo se necessario)
+# GARMIN_SYNC_PIP_INSECURE=1

@@ -46,3 +46,8 @@ docker run --env-file .env -v "$(pwd)/garth_tokens:/app/garth_tokens" garmin-syn
 
 Monta anche `firebase-service-account.json` se usi Firebase:
 `-v "$(pwd)/firebase-service-account.json:/app/firebase-service-account.json"`
+
+## Raspberry Pi e log
+
+Deploy automatico da GitHub: vedi **`RPI_DEPLOY.md`**.  
+Log diagnostici verso Garmin (circa **1 giorno** su disco): `logs/garmin_comms.log` (oltre a `garmin.log` e `journalctl -u garmin-sync`).

@@ -11,6 +11,7 @@ tokens/*
 # Log
 garmin_sync.log
 garmin.log
+logs/
 
 # Python
 __pycache__/
@@ -19,6 +20,9 @@ __pycache__/
 .venv/
 venv/
 .env.local
+
+# Frammento .env Firebase (generato da scripts/rpi_setup/encode_firebase_credentials_b64.ps1)
+scripts/rpi_setup/garmin-sync-firebase.env.fragment.txt
 
 # IDE / OS
 .idea/

@@ -123,13 +123,13 @@ def _load_firebase_cred():
             logger.error(f"FIREBASE_CREDENTIALS_B64 non valido: {e}")
             raise ValueError(
                 "FIREBASE_CREDENTIALS_B64 non valido. Verifica che sia Base64 del JSON "
-                "firebase-service-account.json. Vedi RENDER_DEPLOY.md."
+                "firebase-service-account.json. Vedi RPI_DEPLOY.md."
             )
 
     logger.error("Manca FIREBASE_CREDENTIALS o FIREBASE_CREDENTIALS_B64")
     raise ValueError(
         "Configura FIREBASE_CREDENTIALS_B64 (o FIREBASE_CREDENTIALS) come variabile d'ambiente. "
-        "Vedi RENDER_DEPLOY.md per Render, oppure .\\set-firebase-secret.ps1 per Fly.io."
+        "Vedi RPI_DEPLOY.md o scripts/rpi_setup/encode_firebase_credentials_b64.ps1."
     )
 
 def _require_db():
@@ -144,6 +144,51 @@ def _require_db():
 
 
 logger.add(os.path.join(BASE_DIR, "garmin.log"), rotation="10 MB", level="INFO")
+
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+
+def _garmin_comms_filter(record: dict) -> bool:
+    """Solo righe con bind(garmin_comms=True) → file dedicato."""
+    return record["extra"].get("garmin_comms") is True
+
+
+logger.add(
+    os.path.join(LOGS_DIR, "garmin_comms.log"),
+    rotation="00:00",
+    retention="1 day",
+    level="DEBUG",
+    encoding="utf-8",
+    filter=_garmin_comms_filter,
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {message}",
+)
+
+
+def _garmin_error_excerpt(exc: BaseException) -> str:
+    """Dettaglio per log diagnostico (no password/email)."""
+    parts = [type(exc).__name__, str(exc)[:500]]
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        sc = getattr(resp, "status_code", None)
+        if sc is not None:
+            parts.append(f"http_status={sc}")
+        text = getattr(resp, "text", None) or ""
+        if text:
+            parts.append(f"body[:300]={text[:300]!r}")
+    return " | ".join(parts)
+
+
+def _log_garmin_comms(event: str, uid: str, exc: BaseException | None = None, extra: str = "") -> None:
+    """Traccia errori/risposte anomale verso Garmin Connect; file conservato ~1 giorno (loguru retention)."""
+    uid_short = (uid[:8] + "…") if len(uid) > 8 else uid
+    msg = f"{event} uid={uid_short}"
+    if exc is not None:
+        msg += f" | {_garmin_error_excerpt(exc)}"
+    if extra:
+        msg += f" | {extra}"
+    logger.bind(garmin_comms=True).warning(msg)
+
 
 # === HELPER: token Garmin su Firestore (collection garmin_tokens/{uid}, campo token_b64) ===
 # Collection separata per evitare che il client legga i token (regole Firestore negano accesso).
@@ -177,7 +222,7 @@ class GarminConnectRequest(BaseModel):
 class GarminSyncRequest(BaseModel):
     uid: str
 
-# === HEALTH CHECK (Fly.io, load balancer) ===
+# === HEALTH CHECK ===
 @app.get("/")
 def health():
     return {
@@ -306,6 +351,11 @@ async def connect_garmin(req: GarminConnectRequest):
         health_days = sync_result.get("health_days_synced", 0)
 
         if not sync_result.get("success", False):
+            _log_garmin_comms(
+                "connect_garmin.sync_after_login_failed",
+                uid,
+                extra=(sync_result.get("message") or "")[:400],
+            )
             _store_sync_status(
                 uid,
                 success=False,
@@ -337,11 +387,13 @@ async def connect_garmin(req: GarminConnectRequest):
             "message": f"Garmin collegato correttamente. Sincronizzate {synced_activities} attivita, {health_days} giorni di dati biometrici."
         }
 
-    except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException):
+    except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException) as e:
+        _log_garmin_comms("connect_garmin.auth_failed", uid, e)
         logger.warning(f"Login fallito per {uid} (credenziali non valide)")
         raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
     except GarthHTTPError as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
+        _log_garmin_comms("connect_garmin.garth_http", uid, e, extra=f"mapped_status={status}")
         if status in (401, 403):
             logger.warning(f"Login fallito per {uid} (HTTP {status})")
             raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
@@ -364,6 +416,7 @@ async def connect_garmin(req: GarminConnectRequest):
         err_msg = _all_messages(e)
         # 429: rate limit - NON confondere con credenziali errate
         if "429" in err_msg or "too many requests" in err_msg:
+            _log_garmin_comms("connect_garmin.rate_limit", uid, e)
             logger.warning(f"Login fallito per {uid}: rate limit Garmin")
             raise HTTPException(
                 status_code=429,
@@ -371,8 +424,10 @@ async def connect_garmin(req: GarminConnectRequest):
             )
         auth_keywords = ("401", "unauthorized", "authentication", "login", "invalid", "credential", "password", "forbidden", "403")
         if any(kw in err_msg for kw in auth_keywords):
+            _log_garmin_comms("connect_garmin.auth_keyword", uid, e)
             logger.warning(f"Login fallito per {uid}: {e}")
             raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
+        _log_garmin_comms("connect_garmin.unexpected", uid, e)
         logger.error(f"Errore {uid}: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Errore interno del server")
 
@@ -447,13 +502,15 @@ async def sync_vitals(req: GarminSyncRequest):
         except Exception:
             pass
         return sync_result
-    except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException, GarthHTTPError):
+    except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException, GarthHTTPError) as e:
+        _log_garmin_comms("sync_vitals.session_invalid", uid, e)
         _delete_garmin_token_from_firestore(uid)
         db.collection("users").document(uid).set({"garmin_linked": False}, merge=True)
         _store_sync_status(uid, success=False, message="Sessione Garmin scaduta.")
         logger.warning(f"Sync vitals fallito per {uid} (token non valido, rimosso)")
         raise HTTPException(status_code=401, detail="Sessione Garmin scaduta. Ricollega l'account.")
     except Exception as e:
+        _log_garmin_comms("sync_vitals.error", uid, e)
         _store_sync_status(uid, success=False, message=str(e))
         logger.error(f"Sync vitals fallito {uid}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -815,6 +872,7 @@ def sync_user(uid: str, client: Garmin | None = None):
             "message": "Sync completata"
         }
     except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException, GarthHTTPError) as e:
+        _log_garmin_comms("sync_user.session_invalid", uid, e)
         _delete_garmin_token_from_firestore(uid)
         db.collection("users").document(uid).set({"garmin_linked": False}, merge=True)
         logger.warning(f"Sync fallito {uid}: token non valido, rimosso - {e}")
@@ -826,6 +884,7 @@ def sync_user(uid: str, client: Garmin | None = None):
             "message": "Sessione Garmin scaduta. Ricollega l'account.",
         }
     except Exception as e:
+        _log_garmin_comms("sync_user.error", uid, e)
         logger.error(f"Sync fallito {uid}: {e}")
         _store_sync_status(uid, success=False, message=str(e))
         return {
@@ -858,13 +917,13 @@ def scheduled_sync():
     logger.info(f"Sync batch completato ({len(users)} utenti)")
 
 
-# === ENDPOINT PER CRON ESTERNO (Fly.io: min_machines=0 spegne la macchina, cron la sveglia) ===
+# === ENDPOINT PER CRON ESTERNO (opzionale) ===
 @app.post("/internal/scheduled-sync")
 async def trigger_scheduled_sync(x_cron_secret: str | None = Header(default=None)):
     """
-    Chiamato da cron esterno (es. cron-job.org ogni 45 min).
-    Richiede header X-Cron-Secret = CRON_SECRET (env).
-    Sveglia la macchina Fly e esegue sync per tutti gli utenti garmin_linked.
+    Chiamato da cron esterno (es. systemd timer sul Pi o servizio esterno).
+    Richiede header X-Cron-Secret = CRON_SECRET (env) se CRON_SECRET è impostato.
+    Esegue sync batch per tutti gli utenti garmin_linked.
     """
     _require_db()
     secret = os.getenv("CRON_SECRET")
@@ -875,7 +934,7 @@ async def trigger_scheduled_sync(x_cron_secret: str | None = Header(default=None
     return {"success": True, "message": "Sync batch eseguito"}
 
 
-# === AVVIO (compatibile Fly.io) ===
+# === AVVIO ===
 if __name__ == "__main__":
     logger.info("🚀 Server avviato con API + scheduler sync ogni 45 min")
     port = int(os.getenv("PORT", "8080"))

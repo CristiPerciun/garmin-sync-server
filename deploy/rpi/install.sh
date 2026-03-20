@@ -1,6 +1,6 @@
 #!/bin/bash
 # Installa/aggiorna garmin-sync-server sul Raspberry Pi.
-# Prerequisito: git, python3-venv (vedi ifev scripts/rpi_setup/02_prepare_environment.sh)
+# Prerequisito: git, python3-venv (vedi scripts/rpi_setup/02_prepare_environment.sh in questo repo)
 #
 # Uso:
 #   git clone https://github.com/CristiPerciun/garmin-sync-server.git
@@ -62,3 +62,9 @@ echo ""
 echo "OK. Configura $TARGET/.env (FIREBASE_CREDENTIALS_B64, GARMIN_*, ecc.) poi:"
 echo "  sudo systemctl restart garmin-sync"
 echo "Timer aggiornamenti: systemctl list-timers | grep garmin"
+echo ""
+echo "Opzionale (fork + branch dedicato, es. fork-sync):"
+echo "  sudo cp $TARGET/deploy/rpi/garmin-sync-env.example /etc/default/garmin-sync-env"
+echo "  sudo nano /etc/default/garmin-sync-env   # es. GARMIN_SYNC_GIT_BRANCH=fork-sync"
+echo "  sudo systemctl daemon-reload"
+echo "Vedi RPI_DEPLOY.md sezione \"Fork GitHub + branch fork-sync\"."

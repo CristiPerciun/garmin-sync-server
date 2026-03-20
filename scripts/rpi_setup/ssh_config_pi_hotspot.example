@@ -1,0 +1,12 @@
+# Copia in C:\Users\TUO_UTENTE\.ssh\config (crea la cartella .ssh se manca).
+# Poi: ssh pi-hotspot
+#
+# Riduce disconnessioni "Connection reset" su hotspot / NAT (keepalive lato client).
+
+Host pi-hotspot
+    HostName 172.20.10.4
+    User cperciun
+    ServerAliveInterval 25
+    ServerAliveCountMax 6
+    TCPKeepAlive yes
+    IPQoS throughput

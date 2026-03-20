@@ -1,0 +1,24 @@
+# Esempio: sostituisci /etc/systemd/system/garmin-sync.service dopo aver caricato i secret cifrati.
+#   sudo cp garmin-sync.service.encrypted /etc/systemd/system/garmin-sync.service
+#   sudo systemctl daemon-reload && sudo systemctl restart garmin-sync
+#
+# Rimuovi da ~/garmin-sync-server/.env le righe FIREBASE_* se usi solo la versione cifrata.
+
+[Unit]
+Description=Garmin Sync Server (FastAPI + scheduler, Firebase da file cifrato)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cperciun
+Group=cperciun
+WorkingDirectory=/home/cperciun/garmin-sync-server
+Environment=PORT=8080
+EnvironmentFile=-/home/cperciun/garmin-sync-server/.env
+ExecStart=/bin/bash /usr/local/sbin/garmin-sync-encrypted-start.sh
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
