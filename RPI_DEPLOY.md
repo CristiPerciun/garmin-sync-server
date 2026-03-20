@@ -66,6 +66,16 @@ sudo systemctl daemon-reload
 
 Poi rilancia `sudo bash deploy/rpi/install.sh`. **Rischio:** disabilita la verifica SSL solo verso i `trusted-host` indicati nello script; in ufficio conviene installare il certificato CA della proxy sul Pi.
 
+### Download pip interrotto (grpcio ~200MB su ARM)
+
+Se `pip` si ferma a metà scaricamento (rete instabile o sessione SSH corta), sul Pi esegui **in locale** (monitor + tastiera o SSH interattivo):
+
+```bash
+cd ~/garmin-sync-server
+bash deploy/rpi/complete_pip.sh
+sudo systemctl restart garmin-sync
+```
+
 ## Comandi utili
 
 | Comando | Effetto |
