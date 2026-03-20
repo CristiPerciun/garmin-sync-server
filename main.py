@@ -107,39 +107,18 @@ app.add_middleware(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # === FIREBASE (secret - mai nel Docker image) ===
-# Supporta FIREBASE_CREDENTIALS (JSON) o FIREBASE_CREDENTIALS_B64 (base64)
-# Base64 evita problemi con caratteri speciali/newline su Windows
+# Logica condivisa e validazione in firebase_credentials.py (B64 tollera spazi/newline; vedi verify script).
 def _load_firebase_cred():
-    import base64
+    from firebase_credentials import certificate_from_environment
 
-    # 1. Prova JSON diretto
-    raw = os.getenv("FIREBASE_CREDENTIALS")
-    if raw:
-        s = raw.strip().lstrip("\ufeff")
-        if s:
-            try:
-                return credentials.Certificate(json.loads(s))
-            except json.JSONDecodeError:
-                pass
-
-    # 2. Prova base64 (consigliato: evita problemi encoding)
-    b64 = os.getenv("FIREBASE_CREDENTIALS_B64")
-    if b64:
-        try:
-            decoded = base64.b64decode(b64.strip()).decode("utf-8")
-            return credentials.Certificate(json.loads(decoded))
-        except Exception as e:
-            logger.error(f"FIREBASE_CREDENTIALS_B64 non valido: {e}")
-            raise ValueError(
-                "FIREBASE_CREDENTIALS_B64 non valido. Verifica che sia Base64 del JSON "
-                "firebase-service-account.json. Vedi RPI_DEPLOY.md."
-            )
-
-    logger.error("Manca FIREBASE_CREDENTIALS o FIREBASE_CREDENTIALS_B64")
-    raise ValueError(
-        "Configura FIREBASE_CREDENTIALS_B64 (o FIREBASE_CREDENTIALS) come variabile d'ambiente. "
-        "Vedi RPI_DEPLOY.md o scripts/rpi_setup/encode_firebase_credentials_b64.ps1."
-    )
+    try:
+        return certificate_from_environment()
+    except ValueError as e:
+        logger.error(f"Credenziali Firebase da .env: {e}")
+        raise ValueError(
+            "Configura FIREBASE_CREDENTIALS_B64 (consigliato sul Pi) o FIREBASE_CREDENTIALS. "
+            "Verifica formato: sul Pi esegui python3 deploy/rpi/verify_firebase_credentials.py"
+        ) from e
 
 def _require_db():
     if db is None:
@@ -230,6 +209,57 @@ def _http_exception_for_garmin_auth_error(e: BaseException) -> HTTPException:
         detail=msg
         or "Autenticazione Garmin non riuscita. Controlla email e password, o account con MFA (vedi README).",
     )
+
+
+def _http_exception_if_firestore_error(e: BaseException) -> HTTPException | None:
+    """
+    Errori Google/Firestore durante salvataggio token o users/{uid} — non sono fallimenti password Garmin.
+    """
+    try:
+        from google.api_core.exceptions import DeadlineExceeded, PermissionDenied
+    except ImportError:
+        PermissionDenied = None  # type: ignore[misc, assignment]
+        DeadlineExceeded = None  # type: ignore[misc, assignment]
+
+    if PermissionDenied is not None and isinstance(e, PermissionDenied):
+        return HTTPException(
+            status_code=503,
+            detail=(
+                "Firestore ha rifiutato l'operazione (403 permessi). "
+                "Il login Garmin può essere andato a buon fine, ma il service account sul Pi non può scrivere su Firebase. "
+                "Verifica: stesso progetto Firebase dell'app; in Google Cloud → IAM assegna al service account del JSON "
+                "(FIREBASE_CREDENTIALS_B64) un ruolo con accesso a Firestore, es. «Cloud Datastore User» o «Editor». "
+                f"Dettaglio: {_truncate_http_detail(str(e), 500)}"
+            ),
+        )
+    if DeadlineExceeded is not None and isinstance(e, DeadlineExceeded):
+        return HTTPException(
+            status_code=503,
+            detail=(
+                "Firestore: timeout (504). Rete lenta dal Pi verso Google o servizio sovraccarico — riprova. "
+                f"Dettaglio: {_truncate_http_detail(str(e), 400)}"
+            ),
+        )
+
+    tname = type(e).__name__
+    em = str(e).lower()
+    if "permissiondenied" in tname.lower() or "missing or insufficient permissions" in em:
+        return HTTPException(
+            status_code=503,
+            detail=(
+                "Google/Firestore: permessi insufficienti (403). Aggiorna IAM del service account sul progetto Firebase. "
+                + _truncate_http_detail(str(e), 600)
+            ),
+        )
+    if "deadlineexceeded" in tname.lower() or "deadline exceeded" in em:
+        return HTTPException(
+            status_code=503,
+            detail=(
+                "Google/Firestore: richiesta scaduta. Controlla Internet del Pi e riprova. "
+                + _truncate_http_detail(str(e), 400)
+            ),
+        )
+    return None
 
 
 # === HELPER: token Garmin su Firestore (collection garmin_tokens/{uid}, campo token_b64) ===
@@ -515,6 +545,12 @@ async def connect_garmin(req: GarminConnectRequest):
             or "Errore client Garmin (Garth). Aggiorna garminconnect e garth sul server (pip install -U garminconnect garth).",
         )
     except Exception as e:
+        fe = _http_exception_if_firestore_error(e)
+        if fe is not None:
+            _log_garmin_comms("connect_garmin.firestore", uid, e)
+            logger.error(f"Firestore/Google durante connect {uid}: {e}")
+            raise fe
+
         def _all_messages(exc):
             msgs = [str(exc)]
             if exc.__cause__:

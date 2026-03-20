@@ -46,6 +46,16 @@ Sul **PC**, dopo aver allineato `fork-sync` a `main` (`merge` o `rebase` + `push
 
 ## Variabili d’ambiente (obbligatorie per avvio)
 
+**Verifica formato credenziali (JSON / Base64) e permessi Firestore** (dopo `pip install` e `.env`):
+
+```bash
+cd ~/garmin-sync-server
+source venv/bin/activate
+python3 deploy/rpi/verify_firebase_credentials.py
+```
+
+Deve mostrare `[OK]` su service account e Firestore. Se fallisce con `PermissionDenied`, il JSON è leggibile ma l’IAM sul progetto è insufficiente (non è un problema “formato”).
+
 Copia sul Pi:
 
 ```bash
@@ -99,6 +109,17 @@ cd ~/garmin-sync-server
 bash deploy/rpi/complete_pip.sh
 sudo systemctl restart garmin-sync
 ```
+
+## Collegamento Garmin fallisce: `403 Missing or insufficient permissions` o `504 Deadline Exceeded`
+
+Questi messaggi nei log (`garmin.log` / `garmin_comms.log`) vengono da **Firestore / Google API**, non da Garmin Connect: il Pi non riesce a **scrivere** `garmin_tokens` o `users/{uid}` dopo (o durante) il login.
+
+1. **Stesso progetto Firebase** dell’app Flutter: il JSON (o `FIREBASE_CREDENTIALS_B64`) deve essere la chiave **Account di servizio** di quel progetto (Firebase Console → Impostazioni progetto → Account di servizio → Genera nuova chiave privata).
+2. **IAM su Google Cloud** (console.cloud.google.com → progetto corretto → IAM): il service account della chiave deve poter usare Firestore, ad es. ruolo **Cloud Datastore User** (`roles/datastore.user`) o **Editor** sul progetto (per prove; in produzione restringi).
+3. **API abilitate**: nel progetto deve risultare attiva **Cloud Firestore API**.
+4. **`504 Deadline Exceeded`**: rete instabile dal Pi a Google, DNS, firewall in uscita; riprova; evita VPN che bloccano `*.googleapis.com`.
+
+Dopo aver corretto IAM o la chiave, `sudo systemctl restart garmin-sync` e riprova il collegamento dall’app.
 
 ## Log errori verso Garmin (~1 giorno su disco)
 

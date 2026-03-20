@@ -144,6 +144,31 @@ def main() -> int:
         fail("GET /", str(e))
         errors += 1
 
+    # 8) Credenziali Firebase + Firestore (opzionale: richiede .env e venv con firebase-admin)
+    print("\n8) Firebase .env + Firestore (opzionale)")
+    env_file = repo / ".env"
+    verify_fb = repo / "deploy" / "rpi" / "verify_firebase_credentials.py"
+    if env_file.is_file() and verify_fb.is_file() and venv_py.is_file():
+        code, out, err = sh(
+            [str(venv_py), str(verify_fb), "--repo", str(repo)],
+            timeout=60,
+        )
+        if code == 0:
+            ok("verify_firebase_credentials.py", "vedi righe [OK] sopra nel blocco script")
+            if out:
+                for line in out.splitlines()[:12]:
+                    print(f"     {line}")
+        else:
+            fail(
+                "verify_firebase_credentials.py",
+                (out or err or "exit != 0")[:200],
+            )
+            errors += 1
+    elif not env_file.is_file():
+        print("     (salta: manca .env)")
+    else:
+        print("     (salta: manca venv o verify_firebase_credentials.py)")
+
     print("\n=== Riepilogo ===")
     if errors == 0:
         print("Tutte le verifiche base sono OK.")
