@@ -14,6 +14,15 @@ try:
 except ImportError:
     from garminconnect import Garmin, GarminConnectConnectionError
     GarminConnectAuthenticationError = GarminConnectConnectionError  # fallback
+
+try:
+    from garminconnect import GarminConnectTooManyRequestsError
+except ImportError:
+
+    class GarminConnectTooManyRequestsError(Exception):
+        """Fallback se garminconnect è vecchio e non espone questa eccezione."""
+
+        pass
 import garth
 try:
     from garth.exc import GarthException, GarthHTTPError
@@ -188,6 +197,39 @@ def _log_garmin_comms(event: str, uid: str, exc: BaseException | None = None, ex
     if extra:
         msg += f" | {extra}"
     logger.bind(garmin_comms=True).warning(msg)
+
+
+def _truncate_http_detail(msg: str, max_len: int = 1600) -> str:
+    msg = (msg or "").strip()
+    if len(msg) > max_len:
+        return msg[: max_len - 1] + "…"
+    return msg
+
+
+def _http_exception_for_garmin_auth_error(e: BaseException) -> HTTPException:
+    """
+    GarminConnectAuthenticationError non significa sempre 'password sbagliata'.
+    La libreria cyberjunky/python-garminconnect distingue SSO/oauth, profilo, ecc.
+    """
+    msg = _truncate_http_detail(str(e))
+    low = msg.lower()
+    if "preauthorized" in low or "oauth-service" in low or "sso token exchange" in low:
+        return HTTPException(
+            status_code=503,
+            detail=msg,
+        )
+    if (
+        "failed to retrieve profile" in low
+        or "failed to retrieve user settings" in low
+        or "invalid profile data" in low
+        or "invalid user settings" in low
+    ):
+        return HTTPException(status_code=503, detail=msg)
+    return HTTPException(
+        status_code=401,
+        detail=msg
+        or "Autenticazione Garmin non riuscita. Controlla email e password, o account con MFA (vedi README).",
+    )
 
 
 # === HELPER: token Garmin su Firestore (collection garmin_tokens/{uid}, campo token_b64) ===
@@ -421,24 +463,57 @@ async def connect_garmin(req: GarminConnectRequest):
             ),
         }
 
-    except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException) as e:
-        _log_garmin_comms("connect_garmin.auth_failed", uid, e)
-        logger.warning(f"Login fallito per {uid} (credenziali non valide)")
-        raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
+    except GarminConnectTooManyRequestsError as e:
+        _log_garmin_comms("connect_garmin.rate_limit_exc", uid, e)
+        logger.warning(f"Login fallito per {uid}: rate limit (libreria)")
+        raise HTTPException(
+            status_code=429,
+            detail=_truncate_http_detail(str(e))
+            or "Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
+        )
+    except GarminConnectAuthenticationError as e:
+        _log_garmin_comms("connect_garmin.auth_error", uid, e)
+        logger.warning(f"Login Garmin authentication {uid}: {e}")
+        raise _http_exception_for_garmin_auth_error(e)
+    except GarminConnectConnectionError as e:
+        _log_garmin_comms("connect_garmin.connection", uid, e)
+        logger.warning(f"Login fallito per {uid} (connessione/API Garmin): {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=_truncate_http_detail(str(e))
+            or "Connessione a Garmin Connect non riuscita. Riprova tra poco.",
+        )
     except GarthHTTPError as e:
+        # Deve stare PRIMA di GarthException (GarthHTTPError ne è sottoclasse).
         status = getattr(getattr(e, "response", None), "status_code", None)
         _log_garmin_comms("connect_garmin.garth_http", uid, e, extra=f"mapped_status={status}")
+        detail = _truncate_http_detail(str(e))
         if status in (401, 403):
             logger.warning(f"Login fallito per {uid} (HTTP {status})")
-            raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
+            raise HTTPException(
+                status_code=401,
+                detail=detail or "Risposta Garmin 401/403 durante il login.",
+            )
         if status == 429:
             logger.warning(f"Login fallito per {uid}: rate limit Garmin (429)")
             raise HTTPException(
                 status_code=429,
-                detail="Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
+                detail=detail
+                or "Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
             )
         logger.error(f"Errore HTTP Garmin {uid}: {status} - {e}")
-        raise HTTPException(status_code=500, detail="Errore interno del server")
+        raise HTTPException(
+            status_code=502,
+            detail=detail or f"Errore HTTP verso Garmin (status {status}).",
+        )
+    except GarthException as e:
+        _log_garmin_comms("connect_garmin.garth_other", uid, e)
+        logger.warning(f"Login fallito per {uid} (Garth): {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=_truncate_http_detail(str(e))
+            or "Errore client Garmin (Garth). Aggiorna garminconnect e garth sul server (pip install -U garminconnect garth).",
+        )
     except Exception as e:
         def _all_messages(exc):
             msgs = [str(exc)]
@@ -447,8 +522,8 @@ async def connect_garmin(req: GarminConnectRequest):
             if exc.__context__:
                 msgs.append(str(exc.__context__))
             return " ".join(msgs).lower()
+
         err_msg = _all_messages(e)
-        # 429: rate limit - NON confondere con credenziali errate
         if "429" in err_msg or "too many requests" in err_msg:
             _log_garmin_comms("connect_garmin.rate_limit", uid, e)
             logger.warning(f"Login fallito per {uid}: rate limit Garmin")
@@ -456,14 +531,27 @@ async def connect_garmin(req: GarminConnectRequest):
                 status_code=429,
                 detail="Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
             )
-        auth_keywords = ("401", "unauthorized", "authentication", "login", "invalid", "credential", "password", "forbidden", "403")
-        if any(kw in err_msg for kw in auth_keywords):
+        if "preauthorized" in err_msg or "oauth-service" in err_msg:
+            _log_garmin_comms("connect_garmin.oauth_generic", uid, e)
+            raise HTTPException(status_code=503, detail=_truncate_http_detail(str(e)))
+        # Evita false positive: parole tipo "login" / "authentication" compaiono in molti errori Garmin non legati alla password.
+        credential_markers = (
+            "incorrect email",
+            "wrong password",
+            "invalid credentials",
+            "invalid_grant",
+            "invalid username",
+        )
+        if any(m in err_msg for m in credential_markers):
             _log_garmin_comms("connect_garmin.auth_keyword", uid, e)
             logger.warning(f"Login fallito per {uid}: {e}")
-            raise HTTPException(status_code=401, detail="Credenziali Garmin non valide")
+            raise HTTPException(status_code=401, detail=_truncate_http_detail(str(e)))
         _log_garmin_comms("connect_garmin.unexpected", uid, e)
         logger.error(f"Errore {uid}: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail="Errore interno del server")
+        raise HTTPException(
+            status_code=500,
+            detail=_truncate_http_detail(f"{type(e).__name__}: {e}", 800),
+        )
 
 # === ENDPOINT SYNC IMMEDIATA (pull-to-refresh / login app) ===
 @app.post("/garmin/sync")

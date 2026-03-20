@@ -51,6 +51,14 @@ Monta anche `firebase-service-account.json` se usi Firebase:
 
 `POST /garmin/connect` valida le credenziali, salva il token e risponde subito con `success: true`. La prima sincronizzazione (2 giorni di `daily_health` + attività, come prima) viene eseguita in un **thread in background**; l’esito aggiorna `garmin_last_sync_*` su Firestore. In caso di errori, cerca nei log `connect_garmin.initial_sync_*` in `logs/garmin_comms.log`.
 
+### Login Garmin: “credenziali non valide” ma sul sito funzionano?
+
+La libreria [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) usa [Garth](https://github.com/matin/garth) (stesso flusso OAuth dell’app ufficiale). Non sempre un fallimento è password errata:
+
+- **HTTP 503 / messaggio “SSO” o “preauthorized” o “oauth-service”**: Garmin ha accettato le credenziali ma lo scambio token è fallito — spesso temporaneo; aggiorna dipendenze sul Pi: `pip install -U garminconnect garth` e riprova dopo 15–30 minuti.
+- **Account con MFA/2FA**: serve supporto MFA nella libreria (`prompt_mfa` / `resume_login`); il nostro endpoint oggi invia solo email+password — se Garmin richiede il secondo fattore, il login può fallire anche con password corretta.
+- **Sul Pi**: esegui `pip install -r requirements.txt` dopo il pull per allineare `garminconnect`/`garth`.
+
 ## Raspberry Pi e log
 
 Deploy automatico da GitHub: vedi **`RPI_DEPLOY.md`**.  
