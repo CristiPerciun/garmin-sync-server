@@ -33,11 +33,16 @@ from pydantic import BaseModel
 
 load_dotenv()
 
+# Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
+db = None
+
 scheduler = BackgroundScheduler()
 
 
 def _run_scheduled_sync():
     """Esegue sync per tutti gli utenti garmin_linked. Usato da scheduler e endpoint."""
+    if db is None:
+        return
     try:
         scheduled_sync()
     except Exception as e:
@@ -46,19 +51,38 @@ def _run_scheduled_sync():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Avvia scheduler e prima sync al bootstrap (Fly.io: machine si sveglia su richiesta)."""
-    scheduler.add_job(_run_scheduled_sync, "interval", minutes=45, id="garmin_sync")
-    scheduler.start()
-    logger.info("⏰ Scheduler avviato: sync ogni 45 min per utenti garmin_linked")
+    """Carica Firebase + scheduler se .env ok; altrimenti API resta su (health + /docs)."""
+    global db
+    try:
+        cred = _load_firebase_cred()
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        logger.info("Firebase / Firestore inizializzati")
+    except Exception as e:
+        logger.error(f"Firebase non disponibile: {e}")
+        db = None
 
-    def run_after_delay():
-        time.sleep(120)  # 2 min per dare tempo al server di essere pronto
-        _run_scheduled_sync()
+    if db is not None:
+        scheduler.add_job(_run_scheduled_sync, "interval", minutes=45, id="garmin_sync")
+        scheduler.start()
+        logger.info("⏰ Scheduler avviato: sync ogni 45 min per utenti garmin_linked")
 
-    threading.Thread(target=run_after_delay, daemon=True).start()
-    logger.info("📅 Prima sync programmata tra 2 minuti")
+        def run_after_delay():
+            time.sleep(120)
+            _run_scheduled_sync()
+
+        threading.Thread(target=run_after_delay, daemon=True).start()
+        logger.info("📅 Prima sync programmata tra 2 minuti")
+    else:
+        logger.warning("Modalità ridotta: nessuno scheduler senza credenziali Firebase in .env")
+
     yield
-    scheduler.shutdown(wait=False)
+    try:
+        if getattr(scheduler, "running", False):
+            scheduler.shutdown(wait=False)
+    except Exception:
+        pass
 
 
 app = FastAPI(title="Garmin Sync - FitAI Analyzer", lifespan=lifespan)
@@ -108,11 +132,16 @@ def _load_firebase_cred():
         "Vedi RENDER_DEPLOY.md per Render, oppure .\\set-firebase-secret.ps1 per Fly.io."
     )
 
-cred = _load_firebase_cred()
+def _require_db():
+    if db is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Firestore non configurato. Sul Pi: ~/garmin-sync-server/.env con FIREBASE_CREDENTIALS_B64 "
+                "poi sudo systemctl restart garmin-sync (vedi RPI_DEPLOY.md)."
+            ),
+        )
 
-if not firebase_admin._apps:
-    firebase_admin.initialize_app(cred)
-db = firestore.client()
 
 logger.add(os.path.join(BASE_DIR, "garmin.log"), rotation="10 MB", level="INFO")
 
@@ -151,7 +180,11 @@ class GarminSyncRequest(BaseModel):
 # === HEALTH CHECK (Fly.io, load balancer) ===
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "garmin-sync-server"}
+    return {
+        "status": "ok",
+        "service": "garmin-sync-server",
+        "firestore": db is not None,
+    }
 
 def _extract_activities_list(raw) -> list:
     """get_activities puo' restituire list o dict con chiave activities/activityList."""
@@ -249,6 +282,7 @@ def _sync_vitals_for_client(
 # === ENDPOINT LOGIN GARMIN (il tasto "Connect Garmin") ===
 @app.post("/garmin/connect")
 async def connect_garmin(req: GarminConnectRequest):
+    _require_db()
     uid = req.uid.strip()
 
     try:
@@ -345,6 +379,7 @@ async def connect_garmin(req: GarminConnectRequest):
 # === ENDPOINT SYNC IMMEDIATA (pull-to-refresh / login app) ===
 @app.post("/garmin/sync")
 async def sync_garmin(req: GarminSyncRequest):
+    _require_db()
     uid = req.uid.strip()
     sync_result = sync_user(uid)
     if not sync_result["success"]:
@@ -362,6 +397,7 @@ async def sync_garmin(req: GarminSyncRequest):
 @app.post("/garmin/disconnect")
 async def disconnect_garmin(req: GarminSyncRequest):
     """Elimina i token Garmin da Firestore e marca l'utente come scollegato."""
+    _require_db()
     uid = req.uid.strip()
 
     try:
@@ -386,6 +422,7 @@ async def disconnect_garmin(req: GarminSyncRequest):
 @app.post("/garmin/sync-vitals")
 async def sync_vitals(req: GarminSyncRequest):
     """Biometrici oggi+ieri + attivita (ultime 20). Usato per pull-to-refresh e post-login."""
+    _require_db()
     uid = req.uid.strip()
     logger.info(f"📥 sync-vitals richiesta ricevuta per uid={uid[:8]}...")
     token_b64 = _get_garmin_token_from_firestore(uid)
@@ -695,6 +732,13 @@ def _sync_daily_health(client: Garmin, uid: str, num_days: int | None = None) ->
 
 # === SYNC PER UTENTE (usa client attivo o token da Firestore) ===
 def sync_user(uid: str, client: Garmin | None = None):
+    if db is None:
+        return {
+            "success": False,
+            "activities_synced": 0,
+            "health_days_synced": 0,
+            "message": "Server non configurato (manca Firebase in .env).",
+        }
     token_b64 = _get_garmin_token_from_firestore(uid) if client is None else None
     if client is None and not token_b64:
         return {
@@ -794,6 +838,8 @@ def sync_user(uid: str, client: Garmin | None = None):
 # === SCHEDULER (multi-utente) ===
 def scheduled_sync():
     """Sync Garmin per tutti gli utenti con garmin_linked=True."""
+    if db is None:
+        return
     logger.info("Inizio sync batch (utenti garmin_linked)...")
     users = list(db.collection("users").where("garmin_linked", "==", True).stream())
     if not users:
@@ -820,6 +866,7 @@ async def trigger_scheduled_sync(x_cron_secret: str | None = Header(default=None
     Richiede header X-Cron-Secret = CRON_SECRET (env).
     Sveglia la macchina Fly e esegue sync per tutti gli utenti garmin_linked.
     """
+    _require_db()
     secret = os.getenv("CRON_SECRET")
     if secret and x_cron_secret != secret:
         raise HTTPException(status_code=403, detail="Secret non valido")
