@@ -324,6 +324,66 @@ def _sync_vitals_for_client(
     }
 
 
+def _initial_sync_after_connect(uid: str, token_b64: str) -> None:
+    """Prima sync vitals dopo /garmin/connect; thread daemon (non blocca la risposta HTTP)."""
+    if db is None:
+        return
+    try:
+        client = Garmin()
+        client.login(tokenstore=token_b64)
+        sync_result = _sync_vitals_for_client(client, uid, num_days=2, activities_limit=50)
+        synced_activities = sync_result.get("activities_synced", 0)
+        health_days = sync_result.get("health_days_synced", 0)
+        if not sync_result.get("success", False):
+            _log_garmin_comms(
+                "connect_garmin.initial_sync_failed",
+                uid,
+                extra=(sync_result.get("message") or "")[:400],
+            )
+            _store_sync_status(
+                uid,
+                success=False,
+                message=sync_result.get("message"),
+                activities_synced=synced_activities,
+                health_days_synced=health_days,
+            )
+            logger.warning(
+                f"Sync iniziale background fallita per {uid}: {sync_result.get('message', '')}"
+            )
+            return
+        _store_sync_status(
+            uid,
+            success=True,
+            message=sync_result.get("message"),
+            activities_synced=synced_activities,
+            health_days_synced=health_days,
+        )
+        try:
+            _save_garmin_token_to_firestore(uid, client.garth.dumps())
+        except Exception:
+            pass
+        logger.success(
+            f"Sync iniziale background ok per {uid} (attivita: {synced_activities}, health: {health_days} giorni)"
+        )
+    except (
+        GarminConnectConnectionError,
+        GarminConnectAuthenticationError,
+        GarthException,
+        GarthHTTPError,
+    ) as e:
+        _log_garmin_comms("connect_garmin.initial_sync_auth", uid, e)
+        _store_sync_status(
+            uid,
+            success=False,
+            message="Sessione Garmin non valida durante la prima sync. Usa Sincronizza o ricollega.",
+        )
+        logger.warning(f"Sync iniziale background: sessione non valida per {uid}: {e}")
+    except Exception as e:
+        _log_garmin_comms("connect_garmin.initial_sync_error", uid, e)
+        _store_sync_status(uid, success=False, message=str(e))
+        logger.error(f"Sync iniziale background fallita {uid}: {type(e).__name__}: {e}")
+
+
 # === ENDPOINT LOGIN GARMIN (il tasto "Connect Garmin") ===
 @app.post("/garmin/connect")
 async def connect_garmin(req: GarminConnectRequest):
@@ -344,47 +404,21 @@ async def connect_garmin(req: GarminConnectRequest):
             "garmin_last_email": req.email
         }, merge=True)
 
-        # Al login facciamo una sync iniziale leggera ma obbligatoria:
-        # se non scrive almeno daily_health/activities, il login non deve risultare "ok".
-        sync_result = _sync_vitals_for_client(client, uid, num_days=2, activities_limit=50)
-        synced_activities = sync_result.get("activities_synced", 0)
-        health_days = sync_result.get("health_days_synced", 0)
-
-        if not sync_result.get("success", False):
-            _log_garmin_comms(
-                "connect_garmin.sync_after_login_failed",
-                uid,
-                extra=(sync_result.get("message") or "")[:400],
-            )
-            _store_sync_status(
-                uid,
-                success=False,
-                message=sync_result.get("message"),
-                activities_synced=synced_activities,
-                health_days_synced=health_days,
-            )
-            logger.warning(f"Garmin collegato per {uid} ma sync fallita: {sync_result.get('message', '')}")
-            return {
-                "success": False,
-                "message": f"Login Garmin riuscito ma sync iniziale fallita: {sync_result.get('message', '')}",
-            }
-
-        _store_sync_status(
-            uid,
-            success=True,
-            message=sync_result.get("message"),
-            activities_synced=synced_activities,
-            health_days_synced=health_days,
-        )
-        # Aggiorna token su Firestore (garth puo' aver fatto refresh durante la sync)
-        try:
-            _save_garmin_token_to_firestore(uid, client.garth.dumps())
-        except Exception:
-            pass
-        logger.success(f"✅ Garmin collegato per UID {uid} (attivita: {synced_activities}, health: {health_days} giorni)")
+        # Prima sync in thread: evita timeout del client (Flutter) mentre Garmin + Firestore impiegano decine di secondi.
+        threading.Thread(
+            target=_initial_sync_after_connect,
+            args=(uid, token_b64),
+            daemon=True,
+            name=f"garmin_initial_sync_{uid[:8]}",
+        ).start()
+        uid_short = (uid[:8] + "…") if len(uid) > 8 else uid
+        logger.info(f"Garmin collegato per uid={uid_short}, prima sync avviata in background")
         return {
             "success": True,
-            "message": f"Garmin collegato correttamente. Sincronizzate {synced_activities} attivita, {health_days} giorni di dati biometrici."
+            "message": (
+                "Garmin collegato. La prima sincronizzazione è in corso; tra poco vedrai attività e dati biometrici, "
+                "oppure usa Sincronizza nell'app."
+            ),
         }
 
     except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException) as e:
