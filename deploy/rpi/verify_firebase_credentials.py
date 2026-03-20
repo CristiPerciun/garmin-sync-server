@@ -11,7 +11,8 @@ Esegui SUL Raspberry Pi (o stessa macchina del servizio), nella venv del progett
 Controlla:
   - presenza e decodifica di FIREBASE_CREDENTIALS_B64 o FIREBASE_CREDENTIALS
   - campi obbligatori nel JSON (type, project_id, private_key, client_email)
-  - initialize_app + lettura minima da Firestore (permessi IAM)
+  - initialize_app + una singola lettura Firestore (get su doc inesistente), con timeout.
+    Evitiamo list_collection_ids: su rete lenta (hotspot) può sembrare “appeso” per minuti.
 
 Se vedi PermissionDenied qui, il problema non è Garmin ma IAM / progetto Firebase.
 """
@@ -21,6 +22,13 @@ import argparse
 import os
 import sys
 from pathlib import Path
+
+
+def _firestore_timeout() -> float:
+    try:
+        return float(os.getenv("FIRESTORE_TIMEOUT_SEC", "120"))
+    except ValueError:
+        return 120.0
 
 
 def main() -> int:
@@ -90,27 +98,35 @@ def main() -> int:
     except Exception as e:
         print(f"[WARN] Impossibile rileggere metadati per display: {e}")
 
+    verify_name = "verify_firebase_credentials_tmp"
     try:
-        if firebase_admin._apps:
-            firebase_admin.delete_app(firebase_admin.get_app())
+        firebase_admin.delete_app(firebase_admin.get_app(verify_name))
     except ValueError:
         pass
 
+    to = _firestore_timeout()
+    print(
+        f"Round-trip Firestore: GET su doc inesistente (timeout {to:.0f}s). "
+        "Su hotspot aspetta senza Ctrl+C…"
+    )
     try:
-        firebase_admin.initialize_app(cert)
-        db = firestore.client()
-        first = next(db.collections(), None)
-        print(
-            f"[OK] Firestore risponde in lettura. "
-            f"Prima collection root: {first.id if first else '(nessuna)'}"
-        )
+        firebase_admin.initialize_app(cert, name=verify_name)
+        db = firestore.client(firebase_admin.get_app(verify_name))
+        db.collection("garmin_tokens").document("__verify_connectivity__").get(timeout=to)
+        print("[OK] Firestore ha risposto (lettura OK; IAM e rete OK per questo test).")
     except Exception as e:
-        print(f"[FAIL] Firestore dopo initialize_app: {type(e).__name__}: {e}")
+        print(f"[FAIL] Firestore: {type(e).__name__}: {e}")
         print(
-            "        Se è PermissionDenied: IAM del service account sul progetto "
-            f"{pid!r} — vedi RPI_DEPLOY.md (Cloud Datastore User / Editor)."
+            "        PermissionDenied → IAM sul service account. "
+            "DeadlineExceeded/504 → rete Pi→Google lenta; prova Wi‑Fi non hotspot o FIRESTORE_TIMEOUT_SEC più alto."
         )
+        print(f"        Progetto: {pid!r}")
         return 1
+    finally:
+        try:
+            firebase_admin.delete_app(firebase_admin.get_app(verify_name))
+        except ValueError:
+            pass
 
     print("\n=== Riepilogo: credenziali OK e Firestore raggiungibile ===")
     return 0
