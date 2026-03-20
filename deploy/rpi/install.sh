@@ -36,10 +36,27 @@ fi
 
 echo "Sync con GitHub ..."
 runuser -u "$USER_NAME" -- git -C "$TARGET" fetch origin
-if runuser -u "$USER_NAME" -- git -C "$TARGET" show-ref --verify --quiet refs/remotes/origin/main; then
-  runuser -u "$USER_NAME" -- git -C "$TARGET" checkout -B main origin/main
+
+# Se /etc/default/garmin-sync-env definisce GARMIN_SYNC_GIT_BRANCH (es. fork-sync), il Pi segue quel branch.
+if [[ -n "${GARMIN_SYNC_GIT_BRANCH:-}" ]]; then
+  TB="$GARMIN_SYNC_GIT_BRANCH"
+  if runuser -u "$USER_NAME" -- git -C "$TARGET" show-ref --verify --quiet "refs/remotes/origin/${TB}"; then
+    echo "Branch tracciato: $TB (da GARMIN_SYNC_GIT_BRANCH)"
+    runuser -u "$USER_NAME" -- git -C "$TARGET" checkout -B "$TB" "origin/${TB}"
+  else
+    echo "ATTENZIONE: origin/${TB} non esiste ancora su GitHub. Resto su main/master; dopo il push di ${TB} rilancia install.sh o attendi il timer."
+    if runuser -u "$USER_NAME" -- git -C "$TARGET" show-ref --verify --quiet refs/remotes/origin/main; then
+      runuser -u "$USER_NAME" -- git -C "$TARGET" checkout -B main origin/main
+    else
+      runuser -u "$USER_NAME" -- git -C "$TARGET" checkout -B master origin/master
+    fi
+  fi
 else
-  runuser -u "$USER_NAME" -- git -C "$TARGET" checkout -B master origin/master
+  if runuser -u "$USER_NAME" -- git -C "$TARGET" show-ref --verify --quiet refs/remotes/origin/main; then
+    runuser -u "$USER_NAME" -- git -C "$TARGET" checkout -B main origin/main
+  else
+    runuser -u "$USER_NAME" -- git -C "$TARGET" checkout -B master origin/master
+  fi
 fi
 
 echo "venv + requirements.txt ..."

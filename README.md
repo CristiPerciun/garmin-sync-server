@@ -50,4 +50,5 @@ Monta anche `firebase-service-account.json` se usi Firebase:
 ## Raspberry Pi e log
 
 Deploy automatico da GitHub: vedi **`RPI_DEPLOY.md`**.  
+Branch **`fork-sync`** + aggiornamento automatico sul Pi: **`docs/WORKFLOW_FORK_SYNC.md`**, script **`deploy/rpi/setup_fork_sync_branch.sh`**.  
 Log diagnostici verso Garmin (circa **1 giorno** su disco): `logs/garmin_comms.log` (oltre a `garmin.log` e `journalctl -u garmin-sync`).

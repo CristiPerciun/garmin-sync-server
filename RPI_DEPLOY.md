@@ -24,31 +24,25 @@ cd garmin-sync-server
 sudo bash deploy/rpi/install.sh
 ```
 
-## Fork GitHub + branch `fork-sync` (consigliato)
+## Fork GitHub + branch `fork-sync` (Pi legato al ramo deploy)
 
-Flusso tipico:
+Documentazione completa del flusso PC → push → Pi: **`docs/WORKFLOW_FORK_SYNC.md`**.
 
-1. **Fork** del repo su GitHub (il tuo `origin` sul PC e sul Pi punta al fork).
-2. Sul PC crei / usi il branch **`fork-sync`**, ci lavori, fai **`git push`** (anche dopo **`git rebase`** + **`git push --force-with-lease`** sul branch).
-3. Sul Pi imposti il branch da seguire e l’URL del fork (se non l’hai già fatto al clone):
+**Una tantum sul Pi** (dopo `git pull` nel repo):
 
-   ```bash
-   cd ~/garmin-sync-server
-   git remote set-url origin https://github.com/TUO_USER/garmin-sync-server.git
-   git fetch origin
-   git checkout -B fork-sync origin/fork-sync   # prima volta, dopo il primo push del branch
-   ```
+```bash
+cd ~/garmin-sync-server
+# opzionale: export GARMIN_SYNC_REPO_URL=https://github.com/TUO_UTENTE/garmin-sync-server.git
+sudo -E bash deploy/rpi/setup_fork_sync_branch.sh
+```
 
-4. Crea **`/etc/default/garmin-sync-env`** (vedi `deploy/rpi/garmin-sync-env.example`):
+Lo script scrive `GARMIN_SYNC_GIT_BRANCH=fork-sync` in `/etc/default/garmin-sync-env`, opzionalmente imposta `origin` sul fork, poi esegue **`install.sh`** (che ora rispetta quel branch invece di forzare sempre `main`).
 
-   ```bash
-   echo 'GARMIN_SYNC_GIT_BRANCH=fork-sync' | sudo tee /etc/default/garmin-sync-env
-   sudo systemctl daemon-reload
-   ```
+Sul **PC**, dopo aver allineato `fork-sync` a `main` (`merge` o `rebase` + `push`, anche `--force-with-lease`):
 
-5. Il timer **`garmin-sync-pull.timer`** ogni ~3 minuti: `git fetch` con refspec che accetta history riscritta → se il commit remoto cambia → **`git reset --hard origin/fork-sync`** → `pip install -r requirements.txt` → **`systemctl restart garmin-sync`**.
+- il timer **`garmin-sync-pull.timer`** (~3 min) esegue fetch → **`reset --hard origin/fork-sync`** → pip → **`systemctl restart garmin-sync`**.
 
-> Il **pull sul PC** non aggiorna il Pi: serve **`git push`** verso GitHub (fork). Il **rebase** è supportato perché il fetch aggiorna `origin/fork-sync` anche quando non è fast-forward.
+> Il **solo `git pull` sul PC** non aggiorna il Pi: serve **`git push origin fork-sync`** sul fork.
 
 ## Variabili d’ambiente (obbligatorie per avvio)
 
@@ -113,6 +107,18 @@ sudo systemctl restart garmin-sync
 | `logs/garmin_comms.log` | Comunicazioni / errori verso Garmin Connect (tipo eccezione, `http_status`, estratto body). **Retention 1 giorno** + rotazione a mezzanotte (poco spazio su SD). |
 | `garmin.log` | Log applicativo generale (rotazione per dimensione). |
 | `journalctl -u garmin-sync -f` | Output uvicorn in tempo reale. |
+
+## Verifica automatica (sul Pi, senza SSH da Cursor)
+
+Dopo `git pull`, dalla directory del repo:
+
+```bash
+cd ~/garmin-sync-server
+python3 deploy/rpi/verify_pi_setup.py
+```
+
+Controlla unit systemd, timer, script in `/usr/local/sbin`, venv, `systemctl is-active`, e `GET http://127.0.0.1:8080/`.  
+Questo script va eseguito **sulla macchina Ubuntu/Raspberry** (terminale locale o tua sessione SSH); l’IDE su Windows non può collegarsi al Pi senza SSH configurato.
 
 ## Comandi utili
 

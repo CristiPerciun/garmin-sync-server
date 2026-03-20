@@ -4,7 +4,8 @@
 #
 # garmin-sync-pull.sh e garmin-sync-pull.service caricano questo file.
 
-# Branch Git da seguire (fork: es. fork-sync). Se omesso, usa il branch attualmente checkout sul Pi.
+# Branch Git da seguire sul Pi (deve esistere su origin, es. dopo push da PC). Consigliato: fork-sync.
+# Impostazione automatica: sudo bash deploy/rpi/setup_fork_sync_branch.sh
 # GARMIN_SYNC_GIT_BRANCH=fork-sync
 
 # Path repo se diverso dal default /home/cperciun/garmin-sync-server
