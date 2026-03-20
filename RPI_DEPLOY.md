@@ -55,6 +55,17 @@ GARMIN_SERVER_URL=http://10.15.22.3:8080
 
 (Usa l’IP reale del Pi.) Fuori dalla LAN continua a usare l’URL pubblico (es. Render).
 
+## Pip e errore SSL (`CERTIFICATE_VERIFY_FAILED`)
+
+Se la rete intercetta HTTPS verso PyPI (certificato self-signed), crea:
+
+```bash
+echo 'GARMIN_SYNC_PIP_INSECURE=1' | sudo tee /etc/default/garmin-sync-env
+sudo systemctl daemon-reload
+```
+
+Poi rilancia `sudo bash deploy/rpi/install.sh`. **Rischio:** disabilita la verifica SSL solo verso i `trusted-host` indicati nello script; in ufficio conviene installare il certificato CA della proxy sul Pi.
+
 ## Comandi utili
 
 | Comando | Effetto |

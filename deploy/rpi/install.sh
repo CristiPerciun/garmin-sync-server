@@ -7,6 +7,20 @@
 #   cd garmin-sync-server && sudo bash deploy/rpi/install.sh
 set -euo pipefail
 
+# SSL aziendale / proxy: crea /etc/default/garmin-sync-env con:
+#   GARMIN_SYNC_PIP_INSECURE=1
+# (o passa la stessa variabile prima di sudo). Sconsigliato salvo reti con MITM su PyPI.
+if [[ -f /etc/default/garmin-sync-env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source /etc/default/garmin-sync-env
+  set +a
+fi
+PIP_EXTRA=()
+if [[ "${GARMIN_SYNC_PIP_INSECURE:-}" == "1" ]]; then
+  PIP_EXTRA=(--trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host www.piwheels.org)
+fi
+
 USER_NAME="${SUDO_USER:-cperciun}"
 HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 TARGET="${GARMIN_SYNC_HOME:-$HOME_DIR/garmin-sync-server}"
@@ -30,8 +44,8 @@ fi
 
 echo "venv + requirements.txt ..."
 runuser -u "$USER_NAME" -- python3 -m venv "$TARGET/venv"
-runuser -u "$USER_NAME" -- "$TARGET/venv/bin/pip" install --upgrade pip
-runuser -u "$USER_NAME" -- "$TARGET/venv/bin/pip" install --no-cache-dir -r "$TARGET/requirements.txt"
+runuser -u "$USER_NAME" -- "$TARGET/venv/bin/pip" install "${PIP_EXTRA[@]}" --upgrade pip
+runuser -u "$USER_NAME" -- "$TARGET/venv/bin/pip" install "${PIP_EXTRA[@]}" --no-cache-dir -r "$TARGET/requirements.txt"
 
 install -m 0755 "$TARGET/deploy/rpi/garmin-sync-pull.sh" /usr/local/sbin/garmin-sync-pull.sh
 cp "$TARGET/deploy/rpi/garmin-sync.service" /etc/systemd/system/garmin-sync.service

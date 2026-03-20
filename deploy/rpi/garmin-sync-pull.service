@@ -3,4 +3,5 @@ Description=Git pull garmin-sync-server e riavvio servizio
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/default/garmin-sync-env
 ExecStart=/usr/local/sbin/garmin-sync-pull.sh
