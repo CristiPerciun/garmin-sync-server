@@ -5,6 +5,11 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore
+
+try:
+    from google.cloud.firestore_v1.base_query import FieldFilter
+except ImportError:
+    FieldFilter = None  # type: ignore[misc, assignment]
 try:
     from garminconnect import (
         Garmin,
@@ -267,9 +272,20 @@ def _http_exception_if_firestore_error(e: BaseException) -> HTTPException | None
 # Validita token Garmin: ~1 anno. Se non valido, viene rimosso e l'utente deve ricollegare.
 GARMIN_TOKENS_COLLECTION = "garmin_tokens"
 
+
+def _firestore_timeout_sec() -> float:
+    """Timeout singole RPC Firestore (get/set/…). Hotspot/rete lenta: default 120s."""
+    try:
+        return float(os.getenv("FIRESTORE_TIMEOUT_SEC", "120"))
+    except ValueError:
+        return 120.0
+
+
 def _get_garmin_token_from_firestore(uid: str) -> str | None:
     """Legge token Garmin (Base64) da Firestore. Ritorna None se assente."""
-    doc = db.collection(GARMIN_TOKENS_COLLECTION).document(uid).get()
+    doc = db.collection(GARMIN_TOKENS_COLLECTION).document(uid).get(
+        timeout=_firestore_timeout_sec(),
+    )
     data = doc.to_dict() or {}
     token = data.get("token_b64")
     return str(token).strip() if token else None
@@ -279,11 +295,14 @@ def _save_garmin_token_to_firestore(uid: str, token_b64: str) -> None:
     db.collection(GARMIN_TOKENS_COLLECTION).document(uid).set(
         {"token_b64": token_b64, "updated_at": datetime.utcnow().isoformat()},
         merge=True,
+        timeout=_firestore_timeout_sec(),
     )
 
 def _delete_garmin_token_from_firestore(uid: str) -> None:
     """Rimuove token Garmin da Firestore (disconnect)."""
-    db.collection(GARMIN_TOKENS_COLLECTION).document(uid).delete()
+    db.collection(GARMIN_TOKENS_COLLECTION).document(uid).delete(
+        timeout=_firestore_timeout_sec(),
+    )
 
 # === MODELLO PER IL LOGIN DALL'APP ===
 class GarminConnectRequest(BaseModel):
@@ -334,6 +353,7 @@ def _store_sync_status(
             "garmin_last_health_days_synced": health_days_synced,
         },
         merge=True,
+        timeout=_firestore_timeout_sec(),
     )
 
 
@@ -470,11 +490,15 @@ async def connect_garmin(req: GarminConnectRequest):
         _save_garmin_token_to_firestore(uid, token_b64)
 
         # Marca utente come collegato su Firestore
-        db.collection("users").document(uid).set({
-            "garmin_linked": True,
-            "garmin_linked_at": datetime.utcnow().isoformat(),
-            "garmin_last_email": req.email
-        }, merge=True)
+        db.collection("users").document(uid).set(
+            {
+                "garmin_linked": True,
+                "garmin_linked_at": datetime.utcnow().isoformat(),
+                "garmin_last_email": req.email,
+            },
+            merge=True,
+            timeout=_firestore_timeout_sec(),
+        )
 
         # Prima sync in thread: evita timeout del client (Flutter) mentre Garmin + Firestore impiegano decine di secondi.
         threading.Thread(
@@ -618,10 +642,14 @@ async def disconnect_garmin(req: GarminSyncRequest):
         logger.info(f"Token Garmin eliminati per {uid}")
 
         # 2. Aggiorna Firestore: garmin_linked = False
-        db.collection("users").document(uid).set({
-            "garmin_linked": False,
-            "garmin_disconnected_at": datetime.utcnow().isoformat(),
-        }, merge=True)
+        db.collection("users").document(uid).set(
+            {
+                "garmin_linked": False,
+                "garmin_disconnected_at": datetime.utcnow().isoformat(),
+            },
+            merge=True,
+            timeout=_firestore_timeout_sec(),
+        )
 
         return {
             "success": True,
@@ -663,7 +691,11 @@ async def sync_vitals(req: GarminSyncRequest):
     except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException, GarthHTTPError) as e:
         _log_garmin_comms("sync_vitals.session_invalid", uid, e)
         _delete_garmin_token_from_firestore(uid)
-        db.collection("users").document(uid).set({"garmin_linked": False}, merge=True)
+        db.collection("users").document(uid).set(
+            {"garmin_linked": False},
+            merge=True,
+            timeout=_firestore_timeout_sec(),
+        )
         _store_sync_status(uid, success=False, message="Sessione Garmin scaduta.")
         logger.warning(f"Sync vitals fallito per {uid} (token non valido, rimosso)")
         raise HTTPException(status_code=401, detail="Sessione Garmin scaduta. Ricollega l'account.")
@@ -752,13 +784,16 @@ def _existing_has_strava(data: dict | None) -> bool:
     )
 
 def _load_existing_activities_for_date(uid: str, date_key: str) -> list[dict]:
-    snapshot = (
+    aq = (
         db.collection("users")
         .document(uid)
         .collection("activities")
-        .where("dateKey", "==", date_key)
-        .stream()
     )
+    if FieldFilter is not None:
+        aq = aq.where(filter=FieldFilter("dateKey", "==", date_key))
+    else:
+        aq = aq.where("dateKey", "==", date_key)
+    snapshot = aq.stream()
     return [{"id": doc.id, **doc.to_dict()} for doc in snapshot]
 
 def _find_matching_activity(existing_docs: list[dict], start_dt: datetime, incoming_type: str):
@@ -1032,7 +1067,11 @@ def sync_user(uid: str, client: Garmin | None = None):
     except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException, GarthHTTPError) as e:
         _log_garmin_comms("sync_user.session_invalid", uid, e)
         _delete_garmin_token_from_firestore(uid)
-        db.collection("users").document(uid).set({"garmin_linked": False}, merge=True)
+        db.collection("users").document(uid).set(
+            {"garmin_linked": False},
+            merge=True,
+            timeout=_firestore_timeout_sec(),
+        )
         logger.warning(f"Sync fallito {uid}: token non valido, rimosso - {e}")
         _store_sync_status(uid, success=False, message="Sessione Garmin scaduta.")
         return {
@@ -1058,7 +1097,12 @@ def scheduled_sync():
     if db is None:
         return
     logger.info("Inizio sync batch (utenti garmin_linked)...")
-    users = list(db.collection("users").where("garmin_linked", "==", True).stream())
+    uq = db.collection("users")
+    if FieldFilter is not None:
+        uq = uq.where(filter=FieldFilter("garmin_linked", "==", True))
+    else:
+        uq = uq.where("garmin_linked", "==", True)
+    users = list(uq.stream())
     if not users:
         logger.info("Nessun utente garmin_linked, sync batch saltata")
         return
