@@ -120,7 +120,8 @@ def main() -> int:
     try:
         firebase_admin.initialize_app(cert, name=verify_name)
         db = firestore.client(firebase_admin.get_app(verify_name))
-        db.collection("garmin_tokens").document("__verify_connectivity__").get(
+        # Firestore riserva gli ID che iniziano con "__"; GET su doc inesistente = round-trip OK.
+        db.collection("garmin_tokens").document("verify_firestore_connectivity").get(
             timeout=to,
             retry=retry_policy,
         )

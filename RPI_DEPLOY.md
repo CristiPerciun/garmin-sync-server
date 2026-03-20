@@ -16,6 +16,14 @@ Repository: [github.com/CristiPerciun/garmin-sync-server](https://github.com/Cri
 - Utente `cperciun` (o imposta `SUDO_USER` quando lanci lo script).
 - `git`, `python3`, `python3-venv`, `pip` (es. script `scripts/rpi_setup/02_prepare_environment.sh` in questo repo).
 
+## Nome stabile per l’app Flutter (mDNS, senza rifare `.env` a ogni IP)
+
+Su Raspberry Pi OS il hostname predefinito è **`raspberrypi`**: in LAN il telefono può usare **`http://raspberrypi.local:8080`** (risoluzione mDNS/Bonjour). L’IP può cambiare col DHCP; il nome **`.local`** resta lo stesso.
+
+- Hostname personalizzato: `sudo hostnamectl set-hostname fitai-garmin` (esempio) → nell’app `.env`: `GARMIN_SERVER_URL=http://fitai-garmin.local:8080`.
+- Serve **stessa rete** (stesso Wi‑Fi / hotspot) tra telefono e Pi.
+- Se `.local` non risolve (raro su Android o reti filtrate), usa un **IP riservato sul router** o **Tailscale** (hostname fisso tipo `pi` in MagicDNS).
+
 ## Installazione
 
 ```bash
