@@ -31,6 +31,11 @@ def _firestore_timeout() -> float:
         return 120.0
 
 
+def _firestore_retry_deadline(rpc_timeout: float) -> float:
+    """Il client Google usa un Retry con deadline default 60s: va allineato al timeout RPC + margine."""
+    return max(180.0, rpc_timeout * 2.5)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verifica FIREBASE_* nel .env e accesso Firestore")
     default_repo = Path.home() / "garmin-sync-server"
@@ -74,6 +79,7 @@ def main() -> int:
 
         import firebase_admin
         from firebase_admin import firestore
+        from google.api_core import retry as api_retry
 
         import firebase_credentials as fc
 
@@ -105,22 +111,35 @@ def main() -> int:
         pass
 
     to = _firestore_timeout()
+    rdeadline = _firestore_retry_deadline(to)
+    retry_policy = api_retry.Retry(deadline=rdeadline)
     print(
-        f"Round-trip Firestore: GET su doc inesistente (timeout {to:.0f}s). "
-        "Su hotspot aspetta senza Ctrl+C…"
+        f"Round-trip Firestore: GET doc di test (timeout RPC {to:.0f}s, retry deadline {rdeadline:.0f}s). "
+        "Su hotspot aspetta…"
     )
     try:
         firebase_admin.initialize_app(cert, name=verify_name)
         db = firestore.client(firebase_admin.get_app(verify_name))
-        db.collection("garmin_tokens").document("__verify_connectivity__").get(timeout=to)
+        db.collection("garmin_tokens").document("__verify_connectivity__").get(
+            timeout=to,
+            retry=retry_policy,
+        )
         print("[OK] Firestore ha risposto (lettura OK; IAM e rete OK per questo test).")
     except Exception as e:
+        err_s = str(e).lower()
         print(f"[FAIL] Firestore: {type(e).__name__}: {e}")
-        print(
-            "        PermissionDenied → IAM sul service account. "
-            "DeadlineExceeded/504 → rete Pi→Google lenta; prova Wi‑Fi non hotspot o FIRESTORE_TIMEOUT_SEC più alto."
-        )
-        print(f"        Progetto: {pid!r}")
+        if "permission" in err_s or "403" in err_s:
+            print(
+                f"        → IAM: sul progetto {pid!r} assegna al service account ruoli Firestore "
+                "(es. Cloud Datastore User). Vedi RPI_DEPLOY.md."
+            )
+        elif "deadline" in err_s or "504" in err_s or "timeout" in err_s or "retryerror" in err_s:
+            print(
+                "        → Rete: Pi→Google troppo lenta o instabile (hotspot). "
+                "Prova Wi‑Fi cablato/router; sul .env aumenta FIRESTORE_TIMEOUT_SEC=240 e riprova."
+            )
+        else:
+            print(f"        Progetto: {pid!r}")
         return 1
     finally:
         try:
