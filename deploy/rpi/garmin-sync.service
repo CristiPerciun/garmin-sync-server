@@ -1,0 +1,19 @@
+[Unit]
+Description=Garmin Sync Server (FastAPI + scheduler)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cperciun
+Group=cperciun
+WorkingDirectory=/home/cperciun/garmin-sync-server
+Environment=PORT=8080
+# Opzionale: credenziali in .env (non committare)
+EnvironmentFile=-/home/cperciun/garmin-sync-server/.env
+ExecStart=/home/cperciun/garmin-sync-server/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

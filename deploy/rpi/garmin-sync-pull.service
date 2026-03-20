@@ -1,0 +1,6 @@
+[Unit]
+Description=Git pull garmin-sync-server e riavvio servizio
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/garmin-sync-pull.sh

@@ -1,0 +1,27 @@
+# Rinomina in deploy-rpi-ssh.yml e configura i secret SOLO se il Pi è raggiungibile dalla rete pubblica
+# (es. Tailscale IP, port forwarding, runner self-hosted). Altrimenti usa il timer systemd (deploy/rpi).
+#
+# Secret GitHub da creare:
+#   RPI_HOST     es. 100.x.x.x (Tailscale) o hostname
+#   RPI_USER     cperciun
+#   RPI_SSH_KEY  chiave privata (PEM) con public key in ~/.ssh/authorized_keys sul Pi
+#
+# name: Deploy to Raspberry Pi
+# on:
+#   push:
+#     branches: [main]
+# jobs:
+#   deploy:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Pull and restart on Pi
+#         uses: appleboy/ssh-action@v1.2.0
+#         with:
+#           host: ${{ secrets.RPI_HOST }}
+#           username: ${{ secrets.RPI_USER }}
+#           key: ${{ secrets.RPI_SSH_KEY }}
+#           script: |
+#             cd ~/garmin-sync-server
+#             git fetch origin main && git reset --hard origin/main
+#             ./venv/bin/pip install --no-cache-dir -r requirements.txt
+#             sudo systemctl restart garmin-sync

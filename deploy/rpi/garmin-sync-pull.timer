@@ -1,0 +1,11 @@
+[Unit]
+Description=Controlla GitHub ogni 3 minuti e aggiorna il server se c'è un nuovo commit
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=3min
+AccuracySec=1min
+Unit=garmin-sync-pull.service
+
+[Install]
+WantedBy=timers.target

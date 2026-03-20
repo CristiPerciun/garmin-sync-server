@@ -1,17 +1,11 @@
-# Garmin Connect
-garminconnect
+# Python 3.12+ / 3.13 (testato su Raspberry Pi OS armv7l)
+garminconnect>=0.2.30
 garth>=0.6.3
-
-# Backend
-firebase-admin>=6.4.0
-python-dotenv>=1.0.0
-
-# Scheduler + logging
-apscheduler>=3.10.0
-loguru>=0.7.0
-tenacity>=8.0.0
-
-# API per il login dall'app Flutter
-fastapi
-uvicorn[standard]
-pydantic
+firebase-admin>=6.5.0
+python-dotenv>=1.0.1
+apscheduler>=3.10.4
+loguru>=0.7.2
+tenacity>=8.2.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.10.0,<3
