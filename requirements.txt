@@ -7,5 +7,6 @@ apscheduler>=3.10.4
 loguru>=0.7.2
 tenacity>=8.2.0
 fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
+# Su Pi / SD piccola: evita uvicorn[standard] (uvloop/httptools compilano e riempiono il disco)
+uvicorn>=0.32.0
 pydantic>=2.10.0,<3
