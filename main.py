@@ -416,7 +416,7 @@ def _sync_vitals_for_client(
                 .document(uid)
                 .collection("activities")
                 .document(doc_id)
-                .set(merged, merge=True)
+                .set(merged, merge=True, timeout=_firestore_timeout_sec())
             )
             if existing is None:
                 existing_docs.append(merged)
@@ -695,9 +695,10 @@ async def sync_vitals(req: GarminSyncRequest):
         client.login(tokenstore=token_b64)
         logger.info(f"🔗 Connesso a Garmin Connect per {uid[:8]}..., avvio sync...")
         sync_result = _sync_vitals_for_client(client, uid, num_days=2, activities_limit=50)
+        vitals_ok = sync_result.get("success", True) is not False
         _store_sync_status(
             uid,
-            success=True,
+            success=vitals_ok,
             message=sync_result.get("message"),
             activities_synced=sync_result.get("activities_synced", 0),
             health_days_synced=sync_result.get("health_days_synced", 0),
@@ -813,8 +814,12 @@ def _load_existing_activities_for_date(uid: str, date_key: str) -> list[dict]:
         aq = aq.where(filter=FieldFilter("dateKey", "==", date_key))
     else:
         aq = aq.where("dateKey", "==", date_key)
-    snapshot = aq.stream()
-    return [{"id": doc.id, **doc.to_dict()} for doc in snapshot]
+    to = _firestore_timeout_sec()
+    try:
+        docs = aq.get(timeout=to)
+    except TypeError:
+        docs = list(aq.stream())
+    return [{"id": doc.id, **(doc.to_dict() or {})} for doc in docs]
 
 def _find_matching_activity(existing_docs: list[dict], start_dt: datetime, incoming_type: str):
     normalized_type = _normalize_activity_type(incoming_type)
@@ -893,6 +898,7 @@ def _refresh_daily_log_index(uid: str, date_key: str):
                 "timestamp": datetime.utcnow(),
             },
             merge=True,
+            timeout=_firestore_timeout_sec(),
         )
     )
 
@@ -978,7 +984,7 @@ def _sync_daily_health(client: Garmin, uid: str, num_days: int | None = None) ->
                     .document(uid)
                     .collection("daily_health")
                     .document(date_str)
-                    .set(safe_data, merge=True)
+                    .set(safe_data, merge=True, timeout=_firestore_timeout_sec())
                 )
             (
                 db.collection("users")
@@ -992,6 +998,7 @@ def _sync_daily_health(client: Garmin, uid: str, num_days: int | None = None) ->
                         "timestamp": datetime.utcnow(),
                     },
                     merge=True,
+                    timeout=_firestore_timeout_sec(),
                 )
             )
             synced_count += 1
@@ -1056,7 +1063,7 @@ def sync_user(uid: str, client: Garmin | None = None):
                     .document(uid)
                     .collection("activities")
                     .document(doc_id)
-                    .set(merged, merge=True)
+                    .set(merged, merge=True, timeout=_firestore_timeout_sec())
                 )
                 if existing is None:
                     existing_docs.append(merged)

@@ -64,6 +64,17 @@ python3 deploy/rpi/verify_firebase_credentials.py
 
 Deve mostrare `[OK]` su service account e Firestore. Se fallisce con `PermissionDenied`, il JSON è leggibile ma l’IAM sul progetto è insufficiente (non è un problema “formato”).
 
+**Pipeline Garmin (token + API + opz. HTTP)** — se l’app va in timeout o mostra dati parziali:
+
+```bash
+export GARMIN_TEST_UID='incolla_il_tuo_Firebase_uid'
+python3 deploy/rpi/verify_garmin_pipeline.py --uid "$GARMIN_TEST_UID"
+# Con `garmin-sync` attivo, prova anche l’endpoint locale:
+python3 deploy/rpi/verify_garmin_pipeline.py --uid "$GARMIN_TEST_UID" --http-test
+```
+
+Se questo script è tutto `[OK]` ma il telefono fallisce, controlla **URL/rete** tra app e Pi, non Garmin sul server.
+
 Copia sul Pi:
 
 ```bash
