@@ -21,6 +21,10 @@ __pycache__/
 venv/
 .env.local
 
+# Script locali (password, IP, token) — mai committare
+scripts/local/
+deploy_to_raspberry.py
+
 # Frammento .env Firebase (generato da scripts/rpi_setup/encode_firebase_credentials_b64.ps1)
 scripts/rpi_setup/garmin-sync-firebase.env.fragment.txt
 
