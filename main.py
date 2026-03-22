@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -821,13 +821,24 @@ def _load_existing_activities_for_date(uid: str, date_key: str) -> list[dict]:
         docs = list(aq.stream())
     return [{"id": doc.id, **(doc.to_dict() or {})} for doc in docs]
 
+def _naive_utc(dt: datetime | None) -> datetime | None:
+    """Converte a datetime naive UTC per confronto (evita naive vs aware)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _find_matching_activity(existing_docs: list[dict], start_dt: datetime, incoming_type: str):
     normalized_type = _normalize_activity_type(incoming_type)
+    start_naive = _naive_utc(start_dt) or start_dt
     for doc in existing_docs:
         candidate_start = _parse_datetime(doc.get("startTime")) or _parse_datetime(doc.get("date"))
         if candidate_start is None:
             continue
-        if abs((candidate_start - start_dt).total_seconds()) > ACTIVITY_MERGE_WINDOW_MINUTES * 60:
+        cand_naive = _naive_utc(candidate_start) or candidate_start
+        if abs((cand_naive - start_naive).total_seconds()) > ACTIVITY_MERGE_WINDOW_MINUTES * 60:
             continue
         candidate_type = _normalize_activity_type(doc.get("activityType"))
         if _same_activity_type(candidate_type, normalized_type):
