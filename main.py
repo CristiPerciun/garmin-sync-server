@@ -51,7 +51,7 @@ import strava_sync
 load_dotenv()
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.0.3"
+SERVER_VERSION = "1.0.4"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -318,6 +318,58 @@ def _http_exception_for_garmin_auth_error(e: BaseException) -> HTTPException:
         detail=msg
         or "Autenticazione Garmin non riuscita. Controlla email e password, o account con MFA (vedi README).",
     )
+
+
+def _garmin_sync_http_exception(e: BaseException) -> HTTPException:
+    """
+    Errori durante sync con token già salvato.
+    Non tutti implicano token invalido: 429/5xx/connessioni vanno trattati come temporanei.
+    """
+    detail = _truncate_http_detail(str(e))
+    if _garmin_error_text_looks_like_rate_limit(detail):
+        return HTTPException(
+            status_code=429,
+            detail=detail
+            or "Garmin sta limitando temporaneamente le richieste. Token mantenuto; riprova più tardi.",
+        )
+
+    if isinstance(e, GarminConnectAuthenticationError):
+        return HTTPException(
+            status_code=401,
+            detail="Sessione Garmin scaduta. Ricollega l'account.",
+        )
+
+    if isinstance(e, GarthHTTPError):
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in (401, 403):
+            return HTTPException(
+                status_code=401,
+                detail="Sessione Garmin scaduta. Ricollega l'account.",
+            )
+        if status is not None and status >= 500:
+            return HTTPException(
+                status_code=503,
+                detail=detail
+                or f"Garmin Connect ha risposto con HTTP {status}. Token mantenuto; riprova più tardi.",
+            )
+
+    if isinstance(e, GarminConnectConnectionError):
+        return HTTPException(
+            status_code=503,
+            detail=detail
+            or "Connessione a Garmin Connect non riuscita. Token mantenuto; riprova più tardi.",
+        )
+
+    return HTTPException(
+        status_code=503,
+        detail=detail
+        or "Errore temporaneo Garmin durante la sync. Token mantenuto; riprova più tardi.",
+    )
+
+
+def _should_delete_garmin_token_after_sync_error(e: BaseException) -> bool:
+    """Elimina i token solo se l'errore indica davvero sessione non valida."""
+    return _garmin_sync_http_exception(e).status_code == 401
 
 
 def _walk_exception_chain(root: BaseException):
@@ -948,15 +1000,20 @@ async def sync_vitals(
         raise
     except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException, GarthHTTPError) as e:
         _log_garmin_comms("sync_vitals.session_invalid", uid, e)
-        _delete_garmin_token_from_firestore(uid)
-        db.collection("users").document(uid).set(
-            {"garmin_linked": False},
-            merge=True,
-            timeout=_firestore_timeout_sec(),
-        )
-        _store_sync_status(uid, success=False, message="Sessione Garmin scaduta.")
-        logger.warning(f"Sync vitals fallito per {uid} (token non valido, rimosso)")
-        raise HTTPException(status_code=401, detail="Sessione Garmin scaduta. Ricollega l'account.")
+        http_exc = _garmin_sync_http_exception(e)
+        if _should_delete_garmin_token_after_sync_error(e):
+            _delete_garmin_token_from_firestore(uid)
+            db.collection("users").document(uid).set(
+                {"garmin_linked": False},
+                merge=True,
+                timeout=_firestore_timeout_sec(),
+            )
+            _store_sync_status(uid, success=False, message=http_exc.detail)
+            logger.warning(f"Sync vitals fallito per {uid} (token non valido, rimosso)")
+        else:
+            _store_sync_status(uid, success=False, message=http_exc.detail)
+            logger.warning(f"Sync vitals fallito per {uid} (errore temporaneo, token mantenuto): {e}")
+        raise http_exc
     except Exception as e:
         _log_garmin_comms("sync_vitals.error", uid, e)
         _store_sync_status(uid, success=False, message=str(e))
@@ -1148,13 +1205,18 @@ async def garmin_sync_today(
         raise
     except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException, GarthHTTPError) as e:
         _log_garmin_comms("sync_today.session_invalid", uid, e)
-        _delete_garmin_token_from_firestore(uid)
-        db.collection("users").document(uid).set(
-            {"garmin_linked": False},
-            merge=True,
-            timeout=_firestore_timeout_sec(),
-        )
-        raise HTTPException(status_code=401, detail="Sessione Garmin scaduta. Ricollega l'account.")
+        http_exc = _garmin_sync_http_exception(e)
+        if _should_delete_garmin_token_after_sync_error(e):
+            _delete_garmin_token_from_firestore(uid)
+            db.collection("users").document(uid).set(
+                {"garmin_linked": False},
+                merge=True,
+                timeout=_firestore_timeout_sec(),
+            )
+            logger.warning(f"sync-today {uid}: token Garmin non valido, rimosso")
+        else:
+            logger.warning(f"sync-today {uid}: errore temporaneo Garmin, token mantenuto - {e}")
+        raise http_exc
     except Exception as e:
         logger.error(f"sync-today {uid}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1972,19 +2034,23 @@ def sync_user(uid: str, client: Garmin | None = None):
         }
     except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException, GarthHTTPError) as e:
         _log_garmin_comms("sync_user.session_invalid", uid, e)
-        _delete_garmin_token_from_firestore(uid)
-        db.collection("users").document(uid).set(
-            {"garmin_linked": False},
-            merge=True,
-            timeout=_firestore_timeout_sec(),
-        )
-        logger.warning(f"Sync fallito {uid}: token non valido, rimosso - {e}")
-        _store_sync_status(uid, success=False, message="Sessione Garmin scaduta.")
+        http_exc = _garmin_sync_http_exception(e)
+        if _should_delete_garmin_token_after_sync_error(e):
+            _delete_garmin_token_from_firestore(uid)
+            db.collection("users").document(uid).set(
+                {"garmin_linked": False},
+                merge=True,
+                timeout=_firestore_timeout_sec(),
+            )
+            logger.warning(f"Sync fallito {uid}: token non valido, rimosso - {e}")
+        else:
+            logger.warning(f"Sync fallito {uid}: errore temporaneo Garmin, token mantenuto - {e}")
+        _store_sync_status(uid, success=False, message=http_exc.detail)
         return {
             "success": False,
             "activities_synced": 0,
             "health_days_synced": 0,
-            "message": "Sessione Garmin scaduta. Ricollega l'account.",
+            "message": http_exc.detail,
         }
     except Exception as e:
         _log_garmin_comms("sync_user.error", uid, e)
