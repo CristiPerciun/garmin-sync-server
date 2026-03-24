@@ -10,9 +10,8 @@ Uso (PowerShell):
 
 Opzionale: $env:GARMIN_TEST_SKIP_FIRESTORE = "1" (default; non usa Firebase).
 
-Ordine in main.py: prima _check_garmin_sso_backoff_or_raise(uid) (legge Firestore),
-poi Garmin.login(). Questo script salta il backoff e prova solo SSO — utile per
-diagnosticare 401/429 lato Garmin.
+Stesso flusso SSO di POST /garmin/connect (senza passare dall’API HTTP).
+Utile per diagnosticare 401/429 lato Garmin.
 """
 from __future__ import annotations
 

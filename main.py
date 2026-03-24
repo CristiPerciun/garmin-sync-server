@@ -58,7 +58,7 @@ from typing import Annotated
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.0.7"
+SERVER_VERSION = "1.0.8"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -318,19 +318,6 @@ def _garmin_error_text_looks_like_rate_limit(text: str) -> bool:
     return "429" in low and "client error" in low
 
 
-def _firestore_value_to_utc_datetime(v) -> datetime | None:
-    if v is None:
-        return None
-    if isinstance(v, datetime):
-        if v.tzinfo is None:
-            return v.replace(tzinfo=timezone.utc)
-        return v.astimezone(timezone.utc)
-    ts = getattr(v, "timestamp", None)
-    if callable(ts):
-        return datetime.fromtimestamp(float(ts()), tz=timezone.utc)
-    return None
-
-
 def _register_garmin_sso_backoff(uid: str, *, reason: str) -> None:
     """Dopo un 429 Garmin SSO: non chiamare subito di nuovo signin (peggiora il blocco)."""
     if db is None:
@@ -372,50 +359,6 @@ def _clear_garmin_sso_backoff(uid: str) -> None:
 
 def _garmin_sso_retry_after_header_value() -> str:
     return str(max(120, int(os.getenv("GARMIN_SSO_BACKOFF_MINUTES", "25")) * 60))
-
-
-def _check_garmin_sso_backoff_or_raise(uid: str) -> None:
-    """Se l'utente ha ricevuto 429 di recente, rifiuta senza contattare Garmin."""
-    if db is None:
-        return
-    try:
-        snap = db.collection("users").document(uid).get(timeout=_firestore_timeout_sec())
-        if not snap.exists:
-            return
-        data = snap.to_dict() or {}
-        until = _firestore_value_to_utc_datetime(data.get("garmin_sso_rate_limited_until"))
-        reason = str(data.get("garmin_sso_rate_limited_reason") or "").strip()
-        if until is None:
-            return
-        # Compat con cooldown salvati da versioni precedenti senza "reason":
-        # non bloccare il login solo su un vecchio timestamp locale.
-        if not reason:
-            logger.warning(
-                f"Cooldown SSO Garmin legacy senza reason per uid={(uid[:8] + '…') if len(uid) > 8 else uid}; lo ignoro e pulisco."
-            )
-            _clear_garmin_sso_backoff(uid)
-            return
-        now = datetime.now(timezone.utc)
-        if now >= until:
-            return
-        wait_sec = max(1, int((until - now).total_seconds()))
-        wait_min = max(1, (wait_sec + 59) // 60)
-        detail = (
-            f"Garmin ha limitato di recente gli accessi SSO per questo account "
-            f"(ultimo 429 registrato dal server: {reason}). "
-            f"Non ripetere il login: peggioreresti il blocco. Riprova tra ~{wait_min} min "
-            f"(dopo le {until.strftime('%H:%M')} UTC). "
-            f"Vedi README: rate limit sso.garmin.com."
-        )
-        raise HTTPException(
-            status_code=429,
-            detail=detail,
-            headers={"Retry-After": str(wait_sec)},
-        )
-    except HTTPException:
-        raise
-    except Exception as ex:
-        logger.warning(f"check_garmin_sso_backoff: {ex} (proseguo senza blocco)")
 
 
 def _http_exception_for_garmin_auth_error(e: BaseException) -> HTTPException:
@@ -871,8 +814,6 @@ async def connect_garmin(
     logger.info(
         f"connect_garmin: inizio login Garmin uid={uid_short} email_host={email_host}"
     )
-
-    _check_garmin_sso_backoff_or_raise(uid)
 
     try:
         # Importante: al primo login NON usare token da path/env (GARMINTOKENS), altrimenti la libreria ignora email/password.
