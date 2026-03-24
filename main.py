@@ -51,7 +51,7 @@ import strava_sync
 load_dotenv()
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.0.1"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -588,6 +588,15 @@ async def connect_garmin(
 ):
     _require_db()
     uid = req.uid.strip()
+    uid_short = (uid[:8] + "…") if len(uid) > 8 else uid
+    email_host = (
+        req.email.strip().split("@")[-1].lower()
+        if "@" in req.email
+        else "?"
+    )
+    logger.info(
+        f"connect_garmin: inizio login Garmin uid={uid_short} email_host={email_host}"
+    )
 
     try:
         client = Garmin(req.email, req.password)
@@ -614,7 +623,6 @@ async def connect_garmin(
             daemon=True,
             name=f"garmin_backfill_{uid[:8]}",
         ).start()
-        uid_short = (uid[:8] + "…") if len(uid) > 8 else uid
         logger.info(f"Garmin collegato per uid={uid_short}, backfill avviato in background")
         return {
             "success": True,
@@ -692,9 +700,15 @@ async def connect_garmin(
             return " ".join(msgs).lower()
 
         err_msg = _all_messages(e)
-        if "429" in err_msg or "too many requests" in err_msg:
+        # Evita falsi 429: la sola sottostringa "429" compare in URL/stack non legati al rate limit.
+        looks_rate_limited = (
+            "too many requests" in err_msg
+            or "rate limit" in err_msg
+            or "too many request" in err_msg
+        )
+        if looks_rate_limited:
             _log_garmin_comms("connect_garmin.rate_limit", uid, e)
-            logger.warning(f"Login fallito per {uid}: rate limit Garmin")
+            logger.warning(f"Login fallito per {uid}: rate limit Garmin (testo eccezione)")
             raise HTTPException(
                 status_code=429,
                 detail="Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
