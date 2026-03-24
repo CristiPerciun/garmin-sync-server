@@ -479,7 +479,7 @@ def health():
         "status": "ok",
         "service": "garmin-sync-server",
         "firestore": db is not None,
-        "version": 1,
+        "version": SERVER_VERSION,
     }
 
 def _extract_activities_list(raw) -> list:
