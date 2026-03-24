@@ -3,6 +3,13 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+
+load_dotenv()
+
+from garmin_env import unset_garth_home_if_incomplete
+
+unset_garth_home_if_incomplete()
+
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -48,10 +55,8 @@ from typing import Annotated
 
 import strava_sync
 
-load_dotenv()
-
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.0.4"
+SERVER_VERSION = "1.0.6"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -224,7 +229,7 @@ def _firestore_value_to_utc_datetime(v) -> datetime | None:
     return None
 
 
-def _register_garmin_sso_backoff(uid: str) -> None:
+def _register_garmin_sso_backoff(uid: str, *, reason: str) -> None:
     """Dopo un 429 Garmin SSO: non chiamare subito di nuovo signin (peggiora il blocco)."""
     if db is None:
         return
@@ -232,12 +237,16 @@ def _register_garmin_sso_backoff(uid: str) -> None:
         minutes = max(5, int(os.getenv("GARMIN_SSO_BACKOFF_MINUTES", "25")))
         until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
         db.collection("users").document(uid).set(
-            {"garmin_sso_rate_limited_until": until},
+            {
+                "garmin_sso_rate_limited_until": until,
+                "garmin_sso_rate_limited_reason": reason,
+            },
             merge=True,
             timeout=_firestore_timeout_sec(),
         )
         logger.info(
-            f"Backoff SSO Garmin uid={(uid[:8] + '…') if len(uid) > 8 else uid} fino a {until.isoformat()} ({minutes} min)"
+            f"Backoff SSO Garmin uid={(uid[:8] + '…') if len(uid) > 8 else uid} "
+            f"fino a {until.isoformat()} ({minutes} min), reason={reason}"
         )
     except Exception as ex:
         logger.warning(f"register_garmin_sso_backoff fallito: {ex}")
@@ -248,7 +257,10 @@ def _clear_garmin_sso_backoff(uid: str) -> None:
         return
     try:
         db.collection("users").document(uid).set(
-            {"garmin_sso_rate_limited_until": None},
+            {
+                "garmin_sso_rate_limited_until": None,
+                "garmin_sso_rate_limited_reason": None,
+            },
             merge=True,
             timeout=_firestore_timeout_sec(),
         )
@@ -270,7 +282,16 @@ def _check_garmin_sso_backoff_or_raise(uid: str) -> None:
             return
         data = snap.to_dict() or {}
         until = _firestore_value_to_utc_datetime(data.get("garmin_sso_rate_limited_until"))
+        reason = str(data.get("garmin_sso_rate_limited_reason") or "").strip()
         if until is None:
+            return
+        # Compat con cooldown salvati da versioni precedenti senza "reason":
+        # non bloccare il login solo su un vecchio timestamp locale.
+        if not reason:
+            logger.warning(
+                f"Cooldown SSO Garmin legacy senza reason per uid={(uid[:8] + '…') if len(uid) > 8 else uid}; lo ignoro e pulisco."
+            )
+            _clear_garmin_sso_backoff(uid)
             return
         now = datetime.now(timezone.utc)
         if now >= until:
@@ -278,7 +299,8 @@ def _check_garmin_sso_backoff_or_raise(uid: str) -> None:
         wait_sec = max(1, int((until - now).total_seconds()))
         wait_min = max(1, (wait_sec + 59) // 60)
         detail = (
-            f"Garmin ha limitato di recente gli accessi SSO per questo account. "
+            f"Garmin ha limitato di recente gli accessi SSO per questo account "
+            f"(ultimo 429 registrato dal server: {reason}). "
             f"Non ripetere il login: peggioreresti il blocco. Riprova tra ~{wait_min} min "
             f"(dopo le {until.strftime('%H:%M')} UTC). "
             f"Vedi README: rate limit sso.garmin.com."
@@ -751,10 +773,16 @@ async def connect_garmin(
     _check_garmin_sso_backoff_or_raise(uid)
 
     try:
-        # Importante: al primo login NON passare tokenstore, altrimenti la libreria prova a caricare token esistenti.
+        # Importante: al primo login NON usare token da path/env (GARMINTOKENS), altrimenti la libreria ignora email/password.
+        # GARTH_HOME incompleto viene rimosso all'avvio (garmin_env); qui evitiamo anche GARMINTOKENS sul processo.
         with _garmin_sso_password_lock:
-            client = Garmin(req.email, req.password)
-            client.login()
+            _old_garmintokens = os.environ.pop("GARMINTOKENS", None)
+            try:
+                client = Garmin(req.email, req.password)
+                client.login()
+            finally:
+                if _old_garmintokens is not None:
+                    os.environ["GARMINTOKENS"] = _old_garmintokens
         _clear_garmin_sso_backoff(uid)
         token_b64 = client.garth.dumps()
         _save_garmin_token_to_firestore(uid, token_b64)
@@ -802,7 +830,7 @@ async def connect_garmin(
     except GarminConnectTooManyRequestsError as e:
         _log_garmin_comms("connect_garmin.rate_limit_exc", uid, e)
         logger.warning(f"Login fallito per {uid}: rate limit (libreria)")
-        _register_garmin_sso_backoff(uid)
+        _register_garmin_sso_backoff(uid, reason="garminconnect_too_many_requests")
         raise HTTPException(
             status_code=429,
             detail=_truncate_http_detail(str(e))
@@ -821,7 +849,7 @@ async def connect_garmin(
             logger.warning(
                 f"Login fallito per {uid}: rate limit Garmin (SSO/API, come ConnectionError)"
             )
-            _register_garmin_sso_backoff(uid)
+            _register_garmin_sso_backoff(uid, reason="connection_error_429_text")
             raise HTTPException(
                 status_code=429,
                 detail=detail
@@ -847,7 +875,7 @@ async def connect_garmin(
             )
         if status == 429 or _garmin_error_text_looks_like_rate_limit(detail):
             logger.warning(f"Login fallito per {uid}: rate limit Garmin (429 / testo risposta)")
-            _register_garmin_sso_backoff(uid)
+            _register_garmin_sso_backoff(uid, reason=f"garth_http_{status or 'text_429'}")
             raise HTTPException(
                 status_code=429,
                 detail=detail
@@ -864,7 +892,7 @@ async def connect_garmin(
         detail = _truncate_http_detail(str(e))
         if _garmin_error_text_looks_like_rate_limit(detail):
             logger.warning(f"Login fallito per {uid}: rate limit Garmin (Garth, testo)")
-            _register_garmin_sso_backoff(uid)
+            _register_garmin_sso_backoff(uid, reason="garth_exception_429_text")
             raise HTTPException(
                 status_code=429,
                 detail=detail
@@ -902,7 +930,7 @@ async def connect_garmin(
         if looks_rate_limited:
             _log_garmin_comms("connect_garmin.rate_limit", uid, e)
             logger.warning(f"Login fallito per {uid}: rate limit Garmin (testo eccezione)")
-            _register_garmin_sso_backoff(uid)
+            _register_garmin_sso_backoff(uid, reason="generic_exception_rate_limit_text")
             raise HTTPException(
                 status_code=429,
                 detail="Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
