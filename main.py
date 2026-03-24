@@ -51,7 +51,7 @@ import strava_sync
 load_dotenv()
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.0.1"
+SERVER_VERSION = "1.0.2"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -194,6 +194,18 @@ def _truncate_http_detail(msg: str, max_len: int = 1600) -> str:
     if len(msg) > max_len:
         return msg[: max_len - 1] + "…"
     return msg
+
+
+def _garmin_error_text_looks_like_rate_limit(text: str) -> bool:
+    """
+    Garmin/sso.garmin.com risponde 429 ma spesso l'eccezione è GarminConnectConnectionError
+    o GarthHTTPError senza status_code valorizzato: il messaggio contiene comunque
+    '429 Client Error' / 'Too Many Requests' (stile requests/httpx).
+    """
+    low = (text or "").lower()
+    if "too many requests" in low or "rate limit" in low:
+        return True
+    return "429" in low and "client error" in low
 
 
 def _http_exception_for_garmin_auth_error(e: BaseException) -> HTTPException:
@@ -647,10 +659,21 @@ async def connect_garmin(
         raise _http_exception_for_garmin_auth_error(e)
     except GarminConnectConnectionError as e:
         _log_garmin_comms("connect_garmin.connection", uid, e)
+        detail = _truncate_http_detail(str(e))
+        if _garmin_error_text_looks_like_rate_limit(detail):
+            _log_garmin_comms("connect_garmin.connection_as_429", uid, e)
+            logger.warning(
+                f"Login fallito per {uid}: rate limit Garmin (SSO/API, come ConnectionError)"
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=detail
+                or "Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
+            )
         logger.warning(f"Login fallito per {uid} (connessione/API Garmin): {e}")
         raise HTTPException(
             status_code=502,
-            detail=_truncate_http_detail(str(e))
+            detail=detail
             or "Connessione a Garmin Connect non riuscita. Riprova tra poco.",
         )
     except GarthHTTPError as e:
@@ -664,8 +687,8 @@ async def connect_garmin(
                 status_code=401,
                 detail=detail or "Risposta Garmin 401/403 durante il login.",
             )
-        if status == 429:
-            logger.warning(f"Login fallito per {uid}: rate limit Garmin (429)")
+        if status == 429 or _garmin_error_text_looks_like_rate_limit(detail):
+            logger.warning(f"Login fallito per {uid}: rate limit Garmin (429 / testo risposta)")
             raise HTTPException(
                 status_code=429,
                 detail=detail
@@ -678,10 +701,18 @@ async def connect_garmin(
         )
     except GarthException as e:
         _log_garmin_comms("connect_garmin.garth_other", uid, e)
+        detail = _truncate_http_detail(str(e))
+        if _garmin_error_text_looks_like_rate_limit(detail):
+            logger.warning(f"Login fallito per {uid}: rate limit Garmin (Garth, testo)")
+            raise HTTPException(
+                status_code=429,
+                detail=detail
+                or "Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
+            )
         logger.warning(f"Login fallito per {uid} (Garth): {e}")
         raise HTTPException(
             status_code=502,
-            detail=_truncate_http_detail(str(e))
+            detail=detail
             or "Errore client Garmin (Garth). Aggiorna garminconnect e garth sul server (pip install -U garminconnect garth).",
         )
     except Exception as e:
