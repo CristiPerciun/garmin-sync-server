@@ -1,7 +1,7 @@
 # Python 3.12+ / 3.13 (testato su Raspberry Pi OS armv7l)
-# Versioni recenti: fix SSO/oauth e messaggi errore più precisi (vedi cyberjunky/python-garminconnect)
-garminconnect>=0.2.38
-garth>=0.6.3
+# garminconnect 0.2.40+ richiede garth <0.7 (vedi metadata PyPI). Aggiorna spesso: fix SSO.
+garminconnect>=0.2.40
+garth>=0.6.3,<0.7
 firebase-admin>=6.5.0
 python-dotenv>=1.0.1
 apscheduler>=3.10.4

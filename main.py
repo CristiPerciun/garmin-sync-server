@@ -58,7 +58,7 @@ from typing import Annotated
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.0.8"
+SERVER_VERSION = "1.0.9"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -359,6 +359,34 @@ def _clear_garmin_sso_backoff(uid: str) -> None:
 
 def _garmin_sso_retry_after_header_value() -> str:
     return str(max(120, int(os.getenv("GARMIN_SSO_BACKOFF_MINUTES", "25")) * 60))
+
+
+def _garmin_connect_pauses(*, phase: str) -> None:
+    """
+    Pausa configurabile per ridurre burst HTTP verso sso.garmin.com (stesso login può
+    generare più richieste interne in <1s). Utile se Garmin risponde 429 «subito».
+    """
+    if phase == "pre_lock":
+        sec = float(os.getenv("GARMIN_PRE_SSO_DELAY_SEC", "0") or 0)
+        key = "GARMIN_PRE_SSO_DELAY_SEC"
+    elif phase == "before_login":
+        sec = float(os.getenv("GARMIN_DELAY_BEFORE_LOGIN_SEC", "0") or 0)
+        key = "GARMIN_DELAY_BEFORE_LOGIN_SEC"
+    else:
+        return
+    if sec <= 0:
+        return
+    logger.info(f"connect_garmin: pausa {sec}s ({key}) — fase {phase}")
+    time.sleep(sec)
+
+
+def _detail_garmin_sso_429_hint() -> str:
+    return (
+        " Suggerimenti: sul Pi `pip install -U garminconnect garth` e riavvio servizio; "
+        "in .env prova `GARMIN_DELAY_BEFORE_LOGIN_SEC=2` (rallenta le richieste interne); "
+        "se persiste, prova rete diversa (hotspot) — il 429 può dipendere da IP/policy Garmin, "
+        "non solo dal numero di click nell’app."
+    )
 
 
 def _http_exception_for_garmin_auth_error(e: BaseException) -> HTTPException:
@@ -816,6 +844,7 @@ async def connect_garmin(
     )
 
     try:
+        _garmin_connect_pauses(phase="pre_lock")
         # Importante: al primo login NON usare token da path/env (GARMINTOKENS), altrimenti la libreria ignora email/password.
         # GARTH_HOME incompleto viene rimosso all'avvio (garmin_env); qui evitiamo anche GARMINTOKENS sul processo.
         _garmin_sso_trace("connect: acquisizione lock SSO (garminconnect → sso.garmin.com)", uid)
@@ -824,6 +853,7 @@ async def connect_garmin(
             _old_garmintokens = os.environ.pop("GARMINTOKENS", None)
             try:
                 client = Garmin(req.email, req.password)
+                _garmin_connect_pauses(phase="before_login")
                 _garmin_sso_trace("connect: invocazione client.login() verso Garmin", uid)
                 client.login()
                 _garmin_sso_trace("connect: client.login() completato OK", uid)
@@ -880,8 +910,10 @@ async def connect_garmin(
         _register_garmin_sso_backoff(uid, reason="garminconnect_too_many_requests")
         raise HTTPException(
             status_code=429,
-            detail=_truncate_http_detail(str(e))
-            or "Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
+            detail=(
+                _truncate_http_detail(str(e)) or "Garmin SSO: 429 Too Many Requests."
+            )
+            + _detail_garmin_sso_429_hint(),
             headers={"Retry-After": _garmin_sso_retry_after_header_value()},
         )
     except GarminConnectAuthenticationError as e:
@@ -889,18 +921,22 @@ async def connect_garmin(
         logger.warning(f"Login Garmin authentication {uid}: {e}")
         raise _http_exception_for_garmin_auth_error(e)
     except GarminConnectConnectionError as e:
-        _log_garmin_comms("connect_garmin.connection", uid, e)
         detail = _truncate_http_detail(str(e))
-        if _garmin_error_text_looks_like_rate_limit(detail):
-            _log_garmin_comms("connect_garmin.connection_as_429", uid, e)
+        is_429_text = _garmin_error_text_looks_like_rate_limit(detail)
+        _log_garmin_comms(
+            "connect_garmin.connection_sso_429" if is_429_text else "connect_garmin.connection",
+            uid,
+            e,
+        )
+        if is_429_text:
             logger.warning(
-                f"Login fallito per {uid}: rate limit Garmin (SSO/API, come ConnectionError)"
+                f"Login fallito per {uid}: Garmin SSO ha risposto HTTP 429 (ConnectionError)"
             )
             _register_garmin_sso_backoff(uid, reason="connection_error_429_text")
             raise HTTPException(
                 status_code=429,
-                detail=detail
-                or "Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
+                detail=(detail or "Garmin SSO: 429 Too Many Requests.")
+                + _detail_garmin_sso_429_hint(),
                 headers={"Retry-After": _garmin_sso_retry_after_header_value()},
             )
         logger.warning(f"Login fallito per {uid} (connessione/API Garmin): {e}")
@@ -925,8 +961,8 @@ async def connect_garmin(
             _register_garmin_sso_backoff(uid, reason=f"garth_http_{status or 'text_429'}")
             raise HTTPException(
                 status_code=429,
-                detail=detail
-                or "Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
+                detail=(detail or "Garmin SSO: 429 Too Many Requests.")
+                + _detail_garmin_sso_429_hint(),
                 headers={"Retry-After": _garmin_sso_retry_after_header_value()},
             )
         logger.error(f"Errore HTTP Garmin {uid}: {status} - {e}")
@@ -942,8 +978,8 @@ async def connect_garmin(
             _register_garmin_sso_backoff(uid, reason="garth_exception_429_text")
             raise HTTPException(
                 status_code=429,
-                detail=detail
-                or "Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
+                detail=(detail or "Garmin SSO: 429 Too Many Requests.")
+                + _detail_garmin_sso_429_hint(),
                 headers={"Retry-After": _garmin_sso_retry_after_header_value()},
             )
         logger.warning(f"Login fallito per {uid} (Garth): {e}")
@@ -980,7 +1016,8 @@ async def connect_garmin(
             _register_garmin_sso_backoff(uid, reason="generic_exception_rate_limit_text")
             raise HTTPException(
                 status_code=429,
-                detail="Troppi tentativi di accesso a Garmin. Attendi 15-30 minuti e riprova.",
+                detail="Garmin SSO: 429 / rate limit (testo eccezione)."
+                + _detail_garmin_sso_429_hint(),
                 headers={"Retry-After": _garmin_sso_retry_after_header_value()},
             )
         if "preauthorized" in err_msg or "oauth-service" in err_msg:
