@@ -47,9 +47,24 @@ docker run --env-file .env -v "$(pwd)/garth_tokens:/app/garth_tokens" garmin-syn
 Monta anche `firebase-service-account.json` se usi Firebase:
 `-v "$(pwd)/firebase-service-account.json:/app/firebase-service-account.json"`
 
+## Documentazione sync
+
+- **Indice / architettura unificata (app + server)**: nel repo FitAI Analyzer, file **`docs/SYNC_ARCHITECTURE.md`**.  
+- **Puntatore da questo repo**: **`docs/SYNC.md`**.
+
 ## API (FitAI Analyzer)
 
-`POST /garmin/connect` valida le credenziali, salva il token e risponde subito con `success: true`. La prima sincronizzazione (2 giorni di `daily_health` + attività, come prima) viene eseguita in un **thread in background**; l’esito aggiorna `garmin_last_sync_*` su Firestore. In caso di errori, cerca nei log `connect_garmin.initial_sync_*` in `logs/garmin_comms.log`.
+| Endpoint | Scopo |
+|----------|--------|
+| `POST /garmin/connect` | Login; risposta rapida con `backfillQueued`. Backfill **~BACKFILL_DAYS** (default 60) in **thread** → `users/{uid}/sync_status/backfill`, `daily_health`, `activities`, `lastSuccessfulSync`. |
+| `POST /garmin/sync-today` | Pull-to-refresh: oggi+ieri + attività recenti (come l’ex sync-vitals leggera). |
+| `POST /garmin/sync-vitals` | Stesso handler di `sync-today` (compat). |
+| `POST /sync/delta` | Delta Garmin + Strava da `lastSuccessfulSync` (body JSON). |
+| `POST /strava/register-tokens` | Salva token in `strava_tokens/{uid}`; backfill Strava in background. |
+| `POST /strava/disconnect` | Elimina token server-side. |
+| `POST /garmin/activity-detail` | Dettaglio attività Garmin o Strava on-demand. |
+
+Variabili: `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET`, `BACKFILL_DAYS`, `GARMIN_BACKFILL_BATCH_DAYS`, opz. `GARMIN_SERVER_BEARER_TOKEN` (allineato all’app). In caso di errori Garmin, cerca `backfill.*` / `connect_garmin.*` in `logs/garmin_comms.log`.
 
 ### Login Garmin: “credenziali non valide” ma sul sito funzionano?
 

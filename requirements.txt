@@ -11,3 +11,4 @@ fastapi>=0.115.0
 # Su Pi / SD piccola: evita uvicorn[standard] (uvloop/httptools compilano e riempiono il disco)
 uvicorn>=0.32.0
 pydantic>=2.10.0,<3
+httpx>=0.27.0
