@@ -5,14 +5,15 @@ from fastapi.testclient import TestClient
 
 
 def test_health_ok():
-    from main import app
+    from main import SERVER_VERSION, app
 
     with TestClient(app) as client:
         r = client.get("/")
         assert r.status_code == 200
         data = r.json()
         assert data.get("status") == "ok" or data.get("service")
-        assert data.get("merge") is True
+        assert data.get("version") == SERVER_VERSION
+        assert isinstance(SERVER_VERSION, str) and len(SERVER_VERSION) > 0
 
 
 def test_openapi_contains_new_paths():

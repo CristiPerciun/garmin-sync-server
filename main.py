@@ -50,6 +50,9 @@ import strava_sync
 
 load_dotenv()
 
+# Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
+SERVER_VERSION = "1.0.0"
+
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
 
@@ -476,8 +479,7 @@ def health():
         "status": "ok",
         "service": "garmin-sync-server",
         "firestore": db is not None,
-        # Segnale di versione deploy: se compare in curl pubblico, il Pi ha preso il nuovo codice.
-        "merge": True,
+        "version": 1,
     }
 
 def _extract_activities_list(raw) -> list:

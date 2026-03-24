@@ -56,7 +56,7 @@ Monta anche `firebase-service-account.json` se usi Firebase:
 
 | Endpoint | Scopo |
 |----------|--------|
-| `GET /` | Health: `status`, `service`, `firestore`, **`merge`** (`true` se il codice include questo campo — utile per verificare che il deploy sul Pi sia aggiornato). |
+| `GET /` | Health: `status`, `service`, `firestore`, **`version`** (stringa in `main.py` → `SERVER_VERSION`; incrementala tu a ogni push per verificare il deploy sul Pi). |
 | `POST /garmin/connect` | Login; risposta rapida con `backfillQueued`. Backfill **~BACKFILL_DAYS** (default 60) in **thread** → `users/{uid}/sync_status/backfill`, `daily_health`, `activities`, `lastSuccessfulSync`. |
 | `POST /garmin/sync-today` | Pull-to-refresh: oggi+ieri + attività recenti (come l’ex sync-vitals leggera). |
 | `POST /garmin/sync-vitals` | Stesso handler di `sync-today` (compat). |
