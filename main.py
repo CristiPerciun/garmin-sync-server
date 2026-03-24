@@ -1,12 +1,13 @@
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from garmin_env import unset_garth_home_if_incomplete
+from garmin_env import env_flag_true, unset_garth_home_if_incomplete
 
 unset_garth_home_if_incomplete()
 
@@ -50,13 +51,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from typing import Annotated
 
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.0.6"
+SERVER_VERSION = "1.0.7"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -91,6 +93,24 @@ async def lifespan(app: FastAPI):
         logger.error(f"Firebase non disponibile: {e}")
         db = None
 
+    if env_flag_true("GARMIN_TRACE_UPSTREAM_HTTP"):
+        import logging
+
+        if not logging.root.handlers:
+            logging.basicConfig(
+                level=logging.DEBUG,
+                format="%(levelname)s %(name)s %(message)s",
+            )
+        for name in (
+            "urllib3.connectionpool",
+            "urllib3.util.retry",
+            "requests.packages.urllib3",
+        ):
+            logging.getLogger(name).setLevel(logging.DEBUG)
+        logger.warning(
+            "GARMIN_TRACE_UPSTREAM_HTTP attivo: urllib3/requests in DEBUG (log voluminoso verso Garmin/HTTP)."
+        )
+
     if db is not None:
         scheduler.add_job(_run_scheduled_sync, "interval", minutes=45, id="garmin_sync")
         scheduler.start()
@@ -123,6 +143,65 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class GarminFlutterHttpTraceMiddleware(BaseHTTPMiddleware):
+    """
+    Log dettagliato traffico app Flutter → FastAPI (file logs/http_trace.log se GARMIN_HTTP_TRACE=1).
+    Non logga mai password: su /garmin/connect solo dimensione body e chiavi JSON.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        if not env_flag_true("GARMIN_HTTP_TRACE"):
+            return await call_next(request)
+        rid = uuid.uuid4().hex[:8]
+        t0 = time.perf_counter()
+        client_ip = request.client.host if request.client else "?"
+        method = request.method
+        path = request.url.path
+        q = str(request.url.query)
+        ct_in = request.headers.get("content-type") or "-"
+        auth_in = bool(request.headers.get("authorization"))
+        body = await request.body()
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        req2 = Request(request.scope, receive)
+        logger.bind(http_trace=True).info(
+            f"rid={rid} <- {method} {path}"
+            + (f"?{q}" if q else "")
+            + f" from={client_ip} ct={ct_in} auth={auth_in} bytes={len(body)}"
+        )
+        if path == "/garmin/connect" and body:
+            try:
+                jd = json.loads(body.decode("utf-8", errors="replace"))
+                keys = sorted(jd.keys()) if isinstance(jd, dict) else []
+                uid_len = len(str(jd.get("uid", ""))) if isinstance(jd, dict) else 0
+                em = str(jd.get("email", "")) if isinstance(jd, dict) else ""
+                email_host = em.split("@")[-1].lower() if "@" in em else "?"
+                logger.bind(http_trace=True).debug(
+                    f"rid={rid} connect_json keys={keys} uid_len={uid_len} email_host={email_host}"
+                )
+            except Exception as ex:
+                logger.bind(http_trace=True).debug(f"rid={rid} connect_json non parsabile: {ex}")
+        try:
+            response = await call_next(req2)
+        except Exception as e:
+            ms = (time.perf_counter() - t0) * 1000
+            logger.bind(http_trace=True).error(
+                f"rid={rid} eccezione dopo {ms:.1f}ms: {type(e).__name__}: {e}"
+            )
+            raise
+        ms = (time.perf_counter() - t0) * 1000
+        logger.bind(http_trace=True).info(
+            f"rid={rid} -> status={response.status_code} ms={ms:.1f}"
+        )
+        return response
+
+
+app.add_middleware(GarminFlutterHttpTraceMiddleware)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # === FIREBASE (secret - mai nel Docker image) ===
@@ -172,6 +251,21 @@ logger.add(
 )
 
 
+def _http_trace_file_filter(record: dict) -> bool:
+    return record["extra"].get("http_trace") is True
+
+
+logger.add(
+    os.path.join(LOGS_DIR, "http_trace.log"),
+    rotation="10 MB",
+    retention="3 days",
+    level="DEBUG",
+    encoding="utf-8",
+    filter=_http_trace_file_filter,
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {message}",
+)
+
+
 def _garmin_error_excerpt(exc: BaseException) -> str:
     """Dettaglio per log diagnostico (no password/email)."""
     parts = [type(exc).__name__, str(exc)[:500]]
@@ -195,6 +289,14 @@ def _log_garmin_comms(event: str, uid: str, exc: BaseException | None = None, ex
     if extra:
         msg += f" | {extra}"
     logger.bind(garmin_comms=True).warning(msg)
+
+
+def _garmin_sso_trace(msg: str, uid: str) -> None:
+    """Passi login SSO verso Garmin (solo se GARMIN_HTTP_TRACE=1) → garmin_comms.log."""
+    if not env_flag_true("GARMIN_HTTP_TRACE"):
+        return
+    uid_short = (uid[:8] + "…") if len(uid) > 8 else uid
+    logger.bind(garmin_comms=True).debug(f"{msg} uid={uid_short}")
 
 
 def _truncate_http_detail(msg: str, max_len: int = 1600) -> str:
@@ -775,11 +877,15 @@ async def connect_garmin(
     try:
         # Importante: al primo login NON usare token da path/env (GARMINTOKENS), altrimenti la libreria ignora email/password.
         # GARTH_HOME incompleto viene rimosso all'avvio (garmin_env); qui evitiamo anche GARMINTOKENS sul processo.
+        _garmin_sso_trace("connect: acquisizione lock SSO (garminconnect → sso.garmin.com)", uid)
         with _garmin_sso_password_lock:
+            _garmin_sso_trace("connect: lock acquisito; costruzione client Garmin + login()", uid)
             _old_garmintokens = os.environ.pop("GARMINTOKENS", None)
             try:
                 client = Garmin(req.email, req.password)
+                _garmin_sso_trace("connect: invocazione client.login() verso Garmin", uid)
                 client.login()
+                _garmin_sso_trace("connect: client.login() completato OK", uid)
             finally:
                 if _old_garmintokens is not None:
                     os.environ["GARMINTOKENS"] = _old_garmintokens

@@ -3,6 +3,12 @@
 import os
 
 
+def env_flag_true(name: str) -> bool:
+    """True se la variabile è 1/true/yes/on (case-insensitive)."""
+    v = (os.environ.get(name) or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def unset_garth_home_if_incomplete() -> None:
     """
     Se GARTH_HOME punta a una cartella senza oauth1_token.json, garth.Client()
