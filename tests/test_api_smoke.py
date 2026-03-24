@@ -12,6 +12,7 @@ def test_health_ok():
         assert r.status_code == 200
         data = r.json()
         assert data.get("status") == "ok" or data.get("service")
+        assert data.get("merge") is True
 
 
 def test_openapi_contains_new_paths():

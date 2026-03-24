@@ -476,6 +476,8 @@ def health():
         "status": "ok",
         "service": "garmin-sync-server",
         "firestore": db is not None,
+        # Segnale di versione deploy: se compare in curl pubblico, il Pi ha preso il nuovo codice.
+        "merge": True,
     }
 
 def _extract_activities_list(raw) -> list:
