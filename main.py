@@ -545,7 +545,11 @@ GARMIN_TOKENS_COLLECTION = "garmin_tokens"
 
 
 def _firestore_timeout_sec() -> float:
-    """Timeout singole RPC Firestore (get/set/…). Hotspot/rete lenta: default 120s."""
+    """
+    Timeout singole RPC Firestore (get/set/…).
+    Default 120s per Pi/hotspot lenti; per client HTTP con timeout breve (es. app mobile)
+    valuta FIRESTORE_TIMEOUT_SEC=20–60 così la API risponde prima su Firestore lento.
+    """
     try:
         return float(os.getenv("FIRESTORE_TIMEOUT_SEC", "120"))
     except ValueError:
@@ -574,6 +578,35 @@ def _delete_garmin_token_from_firestore(uid: str) -> None:
     db.collection(GARMIN_TOKENS_COLLECTION).document(uid).delete(
         timeout=_firestore_timeout_sec(),
     )
+
+
+def _garmin_last_linked_email_lower(uid: str) -> str | None:
+    """Ultima email Garmin salvata su users/{uid} dopo un connect riuscito."""
+    if db is None:
+        return None
+    try:
+        snap = db.collection("users").document(uid).get(
+            timeout=_firestore_timeout_sec(),
+        )
+        em = (snap.to_dict() or {}).get("garmin_last_email")
+        if not em:
+            return None
+        return str(em).strip().lower()
+    except Exception as ex:
+        logger.debug(f"_garmin_last_linked_email_lower: {ex}")
+        return None
+
+
+def _garmin_connect_ignore_stored_token(uid: str, request_email: str) -> bool:
+    """
+    Se l'app invia un'email diversa dall'ultimo collegamento, non riusare il token salvato
+    (evita sessione Garmin di un altro account sullo stesso uid Firebase).
+    """
+    last = _garmin_last_linked_email_lower(uid)
+    if not last:
+        return False
+    cur = request_email.strip().lower()
+    return bool(cur and last != cur)
 
 
 STRAVA_TOKENS_COLLECTION = "strava_tokens"
@@ -845,18 +878,75 @@ async def connect_garmin(
 
     try:
         _garmin_connect_pauses(phase="pre_lock")
-        # Importante: al primo login NON usare token da path/env (GARMINTOKENS), altrimenti la libreria ignora email/password.
-        # GARTH_HOME incompleto viene rimosso all'avvio (garmin_env); qui evitiamo anche GARMINTOKENS sul processo.
+        stored_token = _get_garmin_token_from_firestore(uid)
+        skip_stored = _garmin_connect_ignore_stored_token(uid, req.email)
+        if stored_token and skip_stored:
+            logger.info(
+                f"connect_garmin: token Firestore ignorato (email diversa da garmin_last_email) uid={uid_short}"
+            )
+        # Importante: togliere GARMINTOKENS dal processo così login() non carica sessioni stray da path/env;
+        # il token utente si passa esplicitamente con login(tokenstore=...) (garth.loads interno alla libreria).
         _garmin_sso_trace("connect: acquisizione lock SSO (garminconnect → sso.garmin.com)", uid)
         with _garmin_sso_password_lock:
             _garmin_sso_trace("connect: lock acquisito; costruzione client Garmin + login()", uid)
             _old_garmintokens = os.environ.pop("GARMINTOKENS", None)
             try:
-                client = Garmin(req.email, req.password)
-                _garmin_connect_pauses(phase="before_login")
-                _garmin_sso_trace("connect: invocazione client.login() verso Garmin", uid)
-                client.login()
-                _garmin_sso_trace("connect: client.login() completato OK", uid)
+                client: Garmin | None = None
+                if stored_token and not skip_stored:
+                    try:
+                        c = Garmin(req.email, req.password)
+                        _garmin_sso_trace(
+                            "connect: tentativo login(tokenstore=) da Firestore (no SSO se sessione valida)",
+                            uid,
+                        )
+                        c.login(tokenstore=stored_token)
+                        _garmin_sso_trace(
+                            "connect: sessione Garmin ripristinata da token (profile/settings via garth)",
+                            uid,
+                        )
+                        logger.info(
+                            f"connect_garmin: sessione esistente riusata per uid={uid_short} (nessun SSO password)"
+                        )
+                        client = c
+                    except GarminConnectTooManyRequestsError:
+                        raise
+                    except GarthHTTPError as e:
+                        st = getattr(getattr(e, "response", None), "status_code", None)
+                        if st == 429 or _garmin_error_text_looks_like_rate_limit(str(e)):
+                            raise
+                        _log_garmin_comms("connect_garmin.token_restore_failed", uid, e)
+                        logger.warning(
+                            f"connect_garmin: token Firestore non valido per {uid_short}, fallback SSO password: {e}"
+                        )
+                        client = None
+                    except GarminConnectConnectionError as e:
+                        if _garmin_error_text_looks_like_rate_limit(str(e)):
+                            raise
+                        _log_garmin_comms("connect_garmin.token_restore_failed", uid, e)
+                        logger.warning(
+                            f"connect_garmin: token Firestore non valido per {uid_short}, fallback SSO password: {e}"
+                        )
+                        client = None
+                    except GarminConnectAuthenticationError as e:
+                        _log_garmin_comms("connect_garmin.token_restore_failed", uid, e)
+                        logger.warning(
+                            f"connect_garmin: token Firestore non valido per {uid_short}, fallback SSO password: {e}"
+                        )
+                        client = None
+                    except GarthException as e:
+                        if _garmin_error_text_looks_like_rate_limit(str(e)):
+                            raise
+                        _log_garmin_comms("connect_garmin.token_restore_failed", uid, e)
+                        logger.warning(
+                            f"connect_garmin: token Firestore non valido per {uid_short}, fallback SSO password: {e}"
+                        )
+                        client = None
+                if client is None:
+                    client = Garmin(req.email, req.password)
+                    _garmin_connect_pauses(phase="before_login")
+                    _garmin_sso_trace("connect: invocazione client.login() SSO email/password", uid)
+                    client.login()
+                    _garmin_sso_trace("connect: client.login() completato OK", uid)
             finally:
                 if _old_garmintokens is not None:
                     os.environ["GARMINTOKENS"] = _old_garmintokens
@@ -881,7 +971,7 @@ async def connect_garmin(
         def _run_backfill_after_delay() -> None:
             if backfill_delay > 0:
                 logger.info(
-                    f"Backfill Garmin uid={uid_short}: attesa {backfill_delay}s dopo login SSO "
+                    f"Backfill Garmin uid={uid_short}: attesa {backfill_delay}s dopo connect "
                     "(riduce sovrapposizione richieste verso Garmin)."
                 )
                 time.sleep(backfill_delay)
