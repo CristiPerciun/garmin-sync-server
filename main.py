@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,7 @@ except ImportError:
 
         pass
 import garth
+import garth.sso as garth_sso
 try:
     from garth.exc import GarthException, GarthHTTPError
 except ImportError:
@@ -62,7 +64,7 @@ from typing import Annotated
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.4"
+SERVER_VERSION = "1.1.5"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -121,15 +123,17 @@ def _garmin_connect2_finalize_success(
 ) -> dict:
     token_b64 = client.dumps()
     _save_garmin_token_to_firestore(uid, token_b64)
+    user_payload = {
+        "garmin_linked": True,
+        "garmin_linked_at": datetime.utcnow().isoformat(),
+        "garmin_connect_method": login_mode,
+        "garmin_sso_rate_limited_until": None,
+        "garmin_sso_rate_limited_reason": None,
+    }
+    if email.strip():
+        user_payload["garmin_last_email"] = email.strip()
     db.collection("users").document(uid).set(
-        {
-            "garmin_linked": True,
-            "garmin_linked_at": datetime.utcnow().isoformat(),
-            "garmin_last_email": email,
-            "garmin_connect_method": login_mode,
-            "garmin_sso_rate_limited_until": None,
-            "garmin_sso_rate_limited_reason": None,
-        },
+        user_payload,
         merge=True,
         timeout=_firestore_timeout_sec(),
     )
@@ -141,6 +145,21 @@ def _garmin_connect2_finalize_success(
             "La sincronizzazione dei dati puo' essere avviata separatamente."
         ),
     }
+
+
+def _extract_service_ticket(raw: str) -> str | None:
+    value = (raw or "").strip()
+    if not value:
+        return None
+    if value.startswith("ST-"):
+        return value
+    m = re.search(r"[?&]ticket=(ST-[A-Za-z0-9._~%-]+)", value)
+    if m:
+        return m.group(1)
+    m = re.search(r"(ST-[A-Za-z0-9._~%-]+)", value)
+    if m:
+        return m.group(1)
+    return None
 
 
 def _run_scheduled_sync():
@@ -792,6 +811,13 @@ class GarminConnect2VerifyRequest(BaseModel):
     login_session_id: str
     mfa_code: str
 
+
+class GarminConnect3ExchangeRequest(BaseModel):
+    uid: str
+    ticket_or_url: str
+    email: str | None = None
+
+
 class GarminSyncRequest(BaseModel):
     uid: str
 
@@ -1390,6 +1416,84 @@ async def connect_garmin2_verify_mfa(
     finally:
         with _garmin_connect2_pending_lock:
             _garmin_connect2_pending_sessions.pop(req.login_session_id, None)
+
+
+@app.post("/garmin/connect3/exchange-ticket")
+async def connect_garmin3_exchange_ticket(
+    req: GarminConnect3ExchangeRequest,
+    _: None = Depends(verify_optional_bearer),
+):
+    _require_db()
+    uid = req.uid.strip()
+    ticket = _extract_service_ticket(req.ticket_or_url)
+    if not ticket:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Ticket Garmin non trovato. Incolla il link finale "
+                "https://sso.garmin.com/sso/embed?ticket=... oppure il valore ST-..."
+            ),
+        )
+    _garmin_connect2_trace(uid, f"connect3 exchange richiesto ticket={ticket[:12]}...")
+    try:
+        client = _garmin_connect2_build_client()
+        oauth1 = garth_sso.get_oauth1_token(ticket, client)
+        oauth2 = garth_sso.exchange(oauth1, client)
+        client.configure(
+            oauth1_token=oauth1,
+            oauth2_token=oauth2,
+            domain=oauth1.domain,
+        )
+        _clear_garmin_sso_backoff(uid)
+        return _garmin_connect2_finalize_success(
+            uid,
+            (req.email or "").strip(),
+            client,
+            login_mode="connect3_ticket",
+        )
+    except Exception as e:
+        fe = _http_exception_if_firestore_error(e)
+        if fe is not None:
+            _log_garmin_comms("connect_garmin3.firestore", uid, e)
+            raise fe
+        detail = _truncate_http_detail(str(e), 800)
+        low = detail.lower()
+        _log_garmin_comms("connect_garmin3.exchange_ticket", uid, e)
+        if "429" in low or "too many requests" in low or "rate limit" in low:
+            _register_garmin_sso_backoff(uid, reason="connect3_exchange_ticket_429")
+            raise HTTPException(
+                status_code=429,
+                detail=detail,
+                headers={"Retry-After": _garmin_sso_retry_after_header_value()},
+            )
+        if (
+            "ticket" in low
+            or "preauthorized" in low
+            or "401" in low
+            or "403" in low
+            or "forbidden" in low
+            or "unauthorized" in low
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Il service ticket Garmin non e' valido o e' scaduto. "
+                    "Apri di nuovo il login nel browser e incolla subito il nuovo link finale."
+                ),
+            )
+        if (
+            "connection reset" in low
+            or "connection aborted" in low
+            or "max retries exceeded" in low
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Garmin ha interrotto la connessione durante lo scambio del ticket. "
+                    "Riprova con un ticket nuovo appena generato."
+                ),
+            )
+        raise HTTPException(status_code=502, detail=detail)
 
 
 # === ENDPOINT SYNC IMMEDIATA (pull-to-refresh / login app) ===
