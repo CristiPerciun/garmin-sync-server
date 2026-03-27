@@ -100,7 +100,8 @@ def _garmin_connect2_build_client() -> "GarthClient":
     timeout = max(15, int(os.getenv("GARMIN_CONNECT2_TIMEOUT_SEC", "30")))
     retries = max(0, int(os.getenv("GARMIN_CONNECT2_RETRIES", "1")))
     backoff = max(0.0, float(os.getenv("GARMIN_CONNECT2_BACKOFF_SEC", "1.0")))
-    return GarthClient(
+    client = GarthClient()
+    client.configure(
         timeout=timeout,
         retries=retries,
         backoff_factor=backoff,
@@ -108,6 +109,7 @@ def _garmin_connect2_build_client() -> "GarthClient":
         pool_connections=1,
         pool_maxsize=1,
     )
+    return client
 
 
 def _garmin_connect2_finalize_success(
