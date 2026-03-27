@@ -80,8 +80,8 @@ _agent_log(
 
 
 def main() -> int:
-    email = (os.environ.get("cristi.perciun@gmail.com") or "").strip()
-    password = os.environ.get("b#Vt25+Ns'ZE#%g")
+    email = (os.environ.get("GARMIN_TEST_EMAIL") or "").strip()
+    password = os.environ.get("GARMIN_TEST_PASSWORD")
     if password is not None:
         password = str(password)
     if not email or not password:

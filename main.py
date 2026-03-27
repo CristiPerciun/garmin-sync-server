@@ -58,7 +58,7 @@ from typing import Annotated
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.1"
+SERVER_VERSION = "1.1.2"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -704,6 +704,7 @@ class GarminConnectRequest(BaseModel):
     uid: str
     email: str
     password: str
+    fresh_login: bool = False
 
 class GarminSyncRequest(BaseModel):
     uid: str
@@ -857,10 +858,16 @@ async def connect_garmin(
     try:
         _garmin_connect_pauses(phase="pre_lock")
         stored_token = _get_garmin_token_from_firestore(uid)
-        skip_stored = _garmin_connect_ignore_stored_token(uid, req.email)
+        skip_stored = req.fresh_login or _garmin_connect_ignore_stored_token(
+            uid,
+            req.email,
+        )
         if stored_token and skip_stored:
+            reason = "fresh_login richiesto dall'app" if req.fresh_login else (
+                "email diversa da garmin_last_email"
+            )
             logger.info(
-                f"connect_garmin: token Firestore ignorato (email diversa da garmin_last_email) uid={uid_short}"
+                f"connect_garmin: token Firestore ignorato ({reason}) uid={uid_short}"
             )
         # Importante: togliere GARMINTOKENS dal processo così login() non carica sessioni stray da path/env;
         # il token utente si passa esplicitamente con login(tokenstore=...) (garth.loads interno alla libreria).
