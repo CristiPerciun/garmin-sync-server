@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test login Garmin SSO (stesso flusso di POST /garmin/connect, senza Firestore).
+Test login Garmin SSO diretto (equivalente al flusso connect2/start, senza Firestore).
 
 Uso (PowerShell):
   cd garmin-sync-server
@@ -10,7 +10,7 @@ Uso (PowerShell):
 
 Opzionale: $env:GARMIN_TEST_SKIP_FIRESTORE = "1" (default; non usa Firebase).
 
-Stesso flusso SSO di POST /garmin/connect (senza passare dall’API HTTP).
+Stesso flusso SSO del login diretto `garth` / `connect2/start` (senza passare dall’API HTTP).
 Utile per diagnosticare 401/429 lato Garmin.
 """
 from __future__ import annotations

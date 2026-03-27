@@ -64,7 +64,7 @@ from typing import Annotated
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.5"
+SERVER_VERSION = "1.1.4"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -241,7 +241,7 @@ app.add_middleware(
 class GarminFlutterHttpTraceMiddleware(BaseHTTPMiddleware):
     """
     Log dettagliato traffico app Flutter → FastAPI (file logs/http_trace.log se GARMIN_HTTP_TRACE=1).
-    Non logga mai password: su /garmin/connect solo dimensione body e chiavi JSON.
+    Non logga mai password: sui flussi /garmin/connect* logga solo dimensione body e chiavi JSON.
     """
 
     async def dispatch(self, request: Request, call_next):
@@ -266,7 +266,7 @@ class GarminFlutterHttpTraceMiddleware(BaseHTTPMiddleware):
             + (f"?{q}" if q else "")
             + f" from={client_ip} ct={ct_in} auth={auth_in} bytes={len(body)}"
         )
-        if path == "/garmin/connect" and body:
+        if path.startswith("/garmin/connect") and body:
             try:
                 jd = json.loads(body.decode("utf-8", errors="replace"))
                 keys = sorted(jd.keys()) if isinstance(jd, dict) else []
@@ -477,37 +477,6 @@ def _garmin_connect_pauses(*, phase: str) -> None:
     time.sleep(sec)
 
 
-def _detail_garmin_sso_429_hint() -> str:
-    """Solo log server — non va nel JSON verso il client (l’app deve vedere solo str(eccezione) garminconnect/garth)."""
-    return (
-        "Suggerimenti operatore: Pi `pip install -U garminconnect garth`, riavvio servizio; "
-        ".env `GARMIN_DELAY_BEFORE_LOGIN_SEC=2` (default codice), opz. `GARMIN_DELAY_AFTER_TOKEN_FAIL_SEC` dopo token scaduto; "
-        "rete diversa (hotspot) se 429 per IP/policy Garmin."
-    )
-
-
-def _http_exception_for_garmin_auth_error(e: BaseException) -> HTTPException:
-    """
-    GarminConnectAuthenticationError non significa sempre 'password sbagliata'.
-    La libreria cyberjunky/python-garminconnect distingue SSO/oauth, profilo, ecc.
-    """
-    msg = _truncate_http_detail(str(e))
-    low = msg.lower()
-    if "preauthorized" in low or "oauth-service" in low or "sso token exchange" in low:
-        return HTTPException(
-            status_code=503,
-            detail=msg,
-        )
-    if (
-        "failed to retrieve profile" in low
-        or "failed to retrieve user settings" in low
-        or "invalid profile data" in low
-        or "invalid user settings" in low
-    ):
-        return HTTPException(status_code=503, detail=msg)
-    return HTTPException(status_code=401, detail=msg or str(e))
-
-
 def _garmin_sync_http_exception(e: BaseException) -> HTTPException:
     """
     Errori durante sync con token già salvato.
@@ -651,35 +620,6 @@ def _delete_garmin_token_from_firestore(uid: str) -> None:
     )
 
 
-def _garmin_last_linked_email_lower(uid: str) -> str | None:
-    """Ultima email Garmin salvata su users/{uid} dopo un connect riuscito."""
-    if db is None:
-        return None
-    try:
-        snap = db.collection("users").document(uid).get(
-            timeout=_firestore_timeout_sec(),
-        )
-        em = (snap.to_dict() or {}).get("garmin_last_email")
-        if not em:
-            return None
-        return str(em).strip().lower()
-    except Exception as ex:
-        logger.debug(f"_garmin_last_linked_email_lower: {ex}")
-        return None
-
-
-def _garmin_connect_ignore_stored_token(uid: str, request_email: str) -> bool:
-    """
-    Se l'app invia un'email diversa dall'ultimo collegamento, non riusare il token salvato
-    (evita sessione Garmin di un altro account sullo stesso uid Firebase).
-    """
-    last = _garmin_last_linked_email_lower(uid)
-    if not last:
-        return False
-    cur = request_email.strip().lower()
-    return bool(cur and last != cur)
-
-
 STRAVA_TOKENS_COLLECTION = "strava_tokens"
 
 
@@ -790,14 +730,6 @@ def verify_optional_bearer(
         raise HTTPException(status_code=401, detail="Missing bearer token")
     if authorization[7:].strip() != expected:
         raise HTTPException(status_code=403, detail="Invalid bearer token")
-
-
-# === MODELLO PER IL LOGIN DALL'APP ===
-class GarminConnectRequest(BaseModel):
-    uid: str
-    email: str
-    password: str
-    fresh_login: bool = False
 
 
 class GarminConnect2StartRequest(BaseModel):
@@ -947,283 +879,6 @@ def _sync_vitals_for_client(
         "message": f"Aggiornati {health_days} giorni biometrici e {len(activities)} attivita.",
         "no_changes": no_changes,
     }
-
-
-# === ENDPOINT LOGIN GARMIN (il tasto "Connect Garmin") ===
-@app.post("/garmin/connect")
-async def connect_garmin(
-    req: GarminConnectRequest,
-    _: None = Depends(verify_optional_bearer),
-):
-    _require_db()
-    uid = req.uid.strip()
-    uid_short = (uid[:8] + "…") if len(uid) > 8 else uid
-    email_host = (
-        req.email.strip().split("@")[-1].lower()
-        if "@" in req.email
-        else "?"
-    )
-    logger.info(
-        f"connect_garmin: inizio login Garmin uid={uid_short} email_host={email_host}"
-    )
-
-    try:
-        _garmin_connect_pauses(phase="pre_lock")
-        stored_token = _get_garmin_token_from_firestore(uid)
-        skip_stored = req.fresh_login or _garmin_connect_ignore_stored_token(
-            uid,
-            req.email,
-        )
-        if stored_token and skip_stored:
-            reason = "fresh_login richiesto dall'app" if req.fresh_login else (
-                "email diversa da garmin_last_email"
-            )
-            logger.info(
-                f"connect_garmin: token Firestore ignorato ({reason}) uid={uid_short}"
-            )
-        # Importante: togliere GARMINTOKENS dal processo così login() non carica sessioni stray da path/env;
-        # il token utente si passa esplicitamente con login(tokenstore=...) (garth.loads interno alla libreria).
-        _garmin_sso_trace("connect: acquisizione lock SSO (garminconnect → sso.garmin.com)", uid)
-        with _garmin_sso_password_lock:
-            _garmin_sso_trace("connect: lock acquisito; costruzione client Garmin + login()", uid)
-            _old_garmintokens = os.environ.pop("GARMINTOKENS", None)
-            try:
-                # Un solo client: login(tokenstore) poi eventualmente login() credenziali (stesso oggetto Garmin).
-                client = Garmin(req.email, req.password)
-                logged_in = False
-                token_restore_attempted = bool(stored_token and not skip_stored)
-
-                if token_restore_attempted:
-                    try:
-                        logger.info(
-                            f"connect_garmin: tentativo ripristino sessione da token Firestore uid={uid_short}"
-                        )
-                        _garmin_sso_trace(
-                            "connect: login(tokenstore=) — sessione valida evita SSO password",
-                            uid,
-                        )
-                        client.login(tokenstore=stored_token)
-                        _garmin_sso_trace(
-                            "connect: sessione ripristinata (profile/settings via garth)",
-                            uid,
-                        )
-                        logger.info(
-                            f"connect_garmin: sessione esistente riusata uid={uid_short} (nessun SSO password)"
-                        )
-                        logged_in = True
-                    except GarminConnectTooManyRequestsError:
-                        raise
-                    except GarthHTTPError as e:
-                        st = getattr(getattr(e, "response", None), "status_code", None)
-                        if st == 429 or _garmin_error_text_looks_like_rate_limit(str(e)):
-                            raise
-                        _log_garmin_comms("connect_garmin.token_restore_failed", uid, e)
-                        logger.warning(
-                            f"connect_garmin: token Firestore non valido uid={uid_short}, "
-                            f"pausa poi SSO password: {e}"
-                        )
-                    except GarminConnectConnectionError as e:
-                        if _garmin_error_text_looks_like_rate_limit(str(e)):
-                            raise
-                        _log_garmin_comms("connect_garmin.token_restore_failed", uid, e)
-                        logger.warning(
-                            f"connect_garmin: token Firestore non valido uid={uid_short}, "
-                            f"pausa poi SSO password: {e}"
-                        )
-                    except GarminConnectAuthenticationError as e:
-                        _log_garmin_comms("connect_garmin.token_restore_failed", uid, e)
-                        logger.warning(
-                            f"connect_garmin: token Firestore non valido uid={uid_short}, "
-                            f"pausa poi SSO password: {e}"
-                        )
-                    except GarthException as e:
-                        if _garmin_error_text_looks_like_rate_limit(str(e)):
-                            raise
-                        _log_garmin_comms("connect_garmin.token_restore_failed", uid, e)
-                        logger.warning(
-                            f"connect_garmin: token Firestore non valido uid={uid_short}, "
-                            f"pausa poi SSO password: {e}"
-                        )
-
-                if not logged_in:
-                    # Pausa tra login(tokenstore) fallito e login() password: garminconnect può già aver tentato
-                    # refresh/SSO dentro la prima chiamata; qui evitiamo un secondo burst immediato.
-                    if token_restore_attempted:
-                        _garmin_connect_pauses(phase="after_failed_token_restore")
-                    _garmin_connect_pauses(phase="before_login")
-                    _garmin_sso_trace("connect: client.login() SSO email/password", uid)
-                    client.login()
-                    _garmin_sso_trace("connect: client.login() SSO completato OK", uid)
-            finally:
-                if _old_garmintokens is not None:
-                    os.environ["GARMINTOKENS"] = _old_garmintokens
-        _clear_garmin_sso_backoff(uid)
-        token_b64 = client.garth.dumps()
-        _save_garmin_token_to_firestore(uid, token_b64)
-
-        # Marca utente come collegato su Firestore
-        db.collection("users").document(uid).set(
-            {
-                "garmin_linked": True,
-                "garmin_linked_at": datetime.utcnow().isoformat(),
-                "garmin_last_email": req.email,
-            },
-            merge=True,
-            timeout=_firestore_timeout_sec(),
-        )
-
-        _set_backfill_status(uid, "pending", progress=0.0, message="In coda", source="garmin")
-        backfill_delay = max(0, int(os.getenv("GARMIN_BACKFILL_AFTER_CONNECT_DELAY_SEC", "90")))
-
-        def _run_backfill_after_delay() -> None:
-            if backfill_delay > 0:
-                logger.info(
-                    f"Backfill Garmin uid={uid_short}: attesa {backfill_delay}s dopo connect "
-                    "(riduce sovrapposizione richieste verso Garmin)."
-                )
-                time.sleep(backfill_delay)
-            _garmin_backfill_worker(uid, token_b64)
-
-        threading.Thread(
-            target=_run_backfill_after_delay,
-            daemon=True,
-            name=f"garmin_backfill_{uid[:8]}",
-        ).start()
-        logger.info(
-            f"Garmin collegato per uid={uid_short}, backfill in avvio tra {backfill_delay}s"
-        )
-        return {
-            "success": True,
-            "backfillQueued": True,
-            "message": (
-                "Garmin collegato. Recupero storico (circa 60 giorni) in corso sul server; "
-                "puoi usare l'app subito e controllare l'avanzamento in sync_status/backfill."
-            ),
-        }
-
-    except GarminConnectTooManyRequestsError as e:
-        _log_garmin_comms("connect_garmin.rate_limit_exc", uid, e)
-        logger.warning(f"Login fallito per {uid}: rate limit (libreria)")
-        logger.info(_detail_garmin_sso_429_hint())
-        _register_garmin_sso_backoff(uid, reason="garminconnect_too_many_requests")
-        d = _truncate_http_detail(str(e)) or str(e)
-        raise HTTPException(
-            status_code=429,
-            detail=d,
-            headers={"Retry-After": _garmin_sso_retry_after_header_value()},
-        )
-    except GarminConnectAuthenticationError as e:
-        _log_garmin_comms("connect_garmin.auth_error", uid, e)
-        logger.warning(f"Login Garmin authentication {uid}: {e}")
-        raise _http_exception_for_garmin_auth_error(e)
-    except GarminConnectConnectionError as e:
-        detail = _truncate_http_detail(str(e))
-        is_429_text = _garmin_error_text_looks_like_rate_limit(detail)
-        _log_garmin_comms(
-            "connect_garmin.connection_sso_429" if is_429_text else "connect_garmin.connection",
-            uid,
-            e,
-        )
-        if is_429_text:
-            logger.warning(
-                f"Login fallito per {uid}: Garmin SSO ha risposto HTTP 429 (ConnectionError)"
-            )
-            logger.info(_detail_garmin_sso_429_hint())
-            _register_garmin_sso_backoff(uid, reason="connection_error_429_text")
-            raise HTTPException(
-                status_code=429,
-                detail=detail or str(e),
-                headers={"Retry-After": _garmin_sso_retry_after_header_value()},
-            )
-        logger.warning(f"Login fallito per {uid} (connessione/API Garmin): {e}")
-        raise HTTPException(status_code=502, detail=detail or str(e))
-    except GarthHTTPError as e:
-        # Deve stare PRIMA di GarthException (GarthHTTPError ne è sottoclasse).
-        status = getattr(getattr(e, "response", None), "status_code", None)
-        _log_garmin_comms("connect_garmin.garth_http", uid, e, extra=f"mapped_status={status}")
-        detail = _truncate_http_detail(str(e))
-        if status in (401, 403):
-            logger.warning(f"Login fallito per {uid} (HTTP {status})")
-            raise HTTPException(status_code=401, detail=detail or str(e))
-        if status == 429 or _garmin_error_text_looks_like_rate_limit(detail):
-            logger.warning(f"Login fallito per {uid}: rate limit Garmin (429 / testo risposta)")
-            logger.info(_detail_garmin_sso_429_hint())
-            _register_garmin_sso_backoff(uid, reason=f"garth_http_{status or 'text_429'}")
-            raise HTTPException(
-                status_code=429,
-                detail=detail or str(e),
-                headers={"Retry-After": _garmin_sso_retry_after_header_value()},
-            )
-        logger.error(f"Errore HTTP Garmin {uid}: {status} - {e}")
-        raise HTTPException(status_code=502, detail=detail or str(e))
-    except GarthException as e:
-        _log_garmin_comms("connect_garmin.garth_other", uid, e)
-        detail = _truncate_http_detail(str(e))
-        if _garmin_error_text_looks_like_rate_limit(detail):
-            logger.warning(f"Login fallito per {uid}: rate limit Garmin (Garth, testo)")
-            logger.info(_detail_garmin_sso_429_hint())
-            _register_garmin_sso_backoff(uid, reason="garth_exception_429_text")
-            raise HTTPException(
-                status_code=429,
-                detail=detail or str(e),
-                headers={"Retry-After": _garmin_sso_retry_after_header_value()},
-            )
-        logger.warning(f"Login fallito per {uid} (Garth): {e}")
-        raise HTTPException(status_code=502, detail=detail or str(e))
-    except Exception as e:
-        fe = _http_exception_if_firestore_error(e)
-        if fe is not None:
-            _log_garmin_comms("connect_garmin.firestore", uid, e)
-            logger.error(f"Firestore/Google durante connect {uid}: {e}")
-            raise fe
-
-        def _all_messages(exc):
-            msgs = [str(exc)]
-            if exc.__cause__:
-                msgs.append(str(exc.__cause__))
-            if exc.__context__:
-                msgs.append(str(exc.__context__))
-            return " ".join(msgs).lower()
-
-        err_msg = _all_messages(e)
-        # Evita falsi 429: la sola sottostringa "429" compare in URL/stack non legati al rate limit.
-        looks_rate_limited = (
-            "too many requests" in err_msg
-            or "rate limit" in err_msg
-            or "too many request" in err_msg
-        )
-        if looks_rate_limited:
-            _log_garmin_comms("connect_garmin.rate_limit", uid, e)
-            logger.warning(f"Login fallito per {uid}: rate limit Garmin (testo eccezione)")
-            logger.info(_detail_garmin_sso_429_hint())
-            _register_garmin_sso_backoff(uid, reason="generic_exception_rate_limit_text")
-            d = _truncate_http_detail(str(e)) or str(e)
-            raise HTTPException(
-                status_code=429,
-                detail=d,
-                headers={"Retry-After": _garmin_sso_retry_after_header_value()},
-            )
-        if "preauthorized" in err_msg or "oauth-service" in err_msg:
-            _log_garmin_comms("connect_garmin.oauth_generic", uid, e)
-            raise HTTPException(status_code=503, detail=_truncate_http_detail(str(e)))
-        # Evita false positive: parole tipo "login" / "authentication" compaiono in molti errori Garmin non legati alla password.
-        credential_markers = (
-            "incorrect email",
-            "wrong password",
-            "invalid credentials",
-            "invalid_grant",
-            "invalid username",
-        )
-        if any(m in err_msg for m in credential_markers):
-            _log_garmin_comms("connect_garmin.auth_keyword", uid, e)
-            logger.warning(f"Login fallito per {uid}: {e}")
-            raise HTTPException(status_code=401, detail=_truncate_http_detail(str(e)))
-        _log_garmin_comms("connect_garmin.unexpected", uid, e)
-        logger.error(f"Errore {uid}: {type(e).__name__}: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=_truncate_http_detail(f"{type(e).__name__}: {e}", 800),
-        )
 
 
 @app.post("/garmin/connect2/start")

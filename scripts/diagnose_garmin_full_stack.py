@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Diagnosi end-to-end: versioni vs requirements.txt, import senza crash, env (GARTH_HOME),
-costruzione Garmin come /garmin/connect, login SSO opzionale.
+costruzione Garmin e login SSO diretto stile `connect2/start`.
 
 Credenziali SSO (in ordine): GARMIN_TEST_EMAIL / GARMIN_TEST_PASSWORD (shell),
 altrimenti GARMIN_EMAIL / GARMIN_PASSWORD da garmin-sync-server/.env dopo load_dotenv.

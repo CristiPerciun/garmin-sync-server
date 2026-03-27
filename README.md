@@ -57,7 +57,9 @@ Monta anche `firebase-service-account.json` se usi Firebase:
 | Endpoint | Scopo |
 |----------|--------|
 | `GET /` | Health: `status`, `service`, `firestore`, **`version`** (stringa in `main.py` → `SERVER_VERSION`; incrementala tu a ogni push per verificare il deploy sul Pi). |
-| `POST /garmin/connect` | Login; risposta rapida con `backfillQueued`. Backfill **~BACKFILL_DAYS** (default 60) in **thread** → `users/{uid}/sync_status/backfill`, `daily_health`, `activities`, `lastSuccessfulSync`. |
+| `POST /garmin/connect2/start` | Login Garmin diretto con `garth`; se Garmin richiede MFA risponde con `mfaRequired` + `loginSessionId`. |
+| `POST /garmin/connect2/verify-mfa` | Completa il login `connect2` con il codice MFA e salva il token Garmin. |
+| `POST /garmin/connect3/exchange-ticket` | Scambia un `service ticket` Garmin (`ST-...` o URL finale `embed?ticket=...`) con i token OAuth e li salva su Firestore. |
 | `POST /garmin/sync-today` | Pull-to-refresh: oggi+ieri + attività recenti (come l’ex sync-vitals leggera). |
 | `POST /garmin/sync-vitals` | Stesso handler di `sync-today` (compat). |
 | `POST /sync/delta` | Delta Garmin + Strava da `lastSuccessfulSync` (body JSON). |
@@ -65,7 +67,7 @@ Monta anche `firebase-service-account.json` se usi Firebase:
 | `POST /strava/disconnect` | Elimina token server-side. |
 | `POST /garmin/activity-detail` | Dettaglio attività Garmin o Strava on-demand. |
 
-Variabili: `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET`, `BACKFILL_DAYS`, `GARMIN_BACKFILL_BATCH_DAYS`, opz. `GARMIN_SERVER_BEARER_TOKEN` (allineato all’app). In caso di errori Garmin, cerca `backfill.*` / `connect_garmin.*` in `logs/garmin_comms.log`.
+Variabili: `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET`, `BACKFILL_DAYS`, `GARMIN_BACKFILL_BATCH_DAYS`, opz. `GARMIN_SERVER_BEARER_TOKEN` (allineato all’app). In caso di errori Garmin, cerca `backfill.*`, `connect_garmin2.*` e `connect_garmin3.*` in `logs/garmin_comms.log`.
 
 ### Login Garmin: “credenziali non valide” ma sul sito funzionano?
 
