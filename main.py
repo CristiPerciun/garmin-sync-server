@@ -44,6 +44,10 @@ except ImportError:
         pass
     GarthException = _DummyGarthException
     GarthHTTPError = _DummyGarthException
+try:
+    from garth.http import Client as GarthClient
+except ImportError:
+    GarthClient = None
 from apscheduler.schedulers.background import BackgroundScheduler
 from loguru import logger
 import threading
@@ -58,7 +62,7 @@ from typing import Annotated
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.2"
+SERVER_VERSION = "1.1.3"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -67,6 +71,74 @@ scheduler = BackgroundScheduler()
 
 # Un solo login SSO email/password alla volta (meno burst verso sso.garmin.com sullo stesso processo)
 _garmin_sso_password_lock = threading.Lock()
+
+# Sessioni MFA temporanee per il flusso connect2 (in memoria sul Pi).
+_garmin_connect2_pending_lock = threading.Lock()
+_garmin_connect2_pending_sessions: dict[str, dict] = {}
+
+
+def _garmin_connect2_cleanup_pending_sessions() -> None:
+    now = datetime.now(timezone.utc)
+    with _garmin_connect2_pending_lock:
+        expired = [
+            sid
+            for sid, payload in _garmin_connect2_pending_sessions.items()
+            if payload.get("expires_at") and payload["expires_at"] <= now
+        ]
+        for sid in expired:
+            _garmin_connect2_pending_sessions.pop(sid, None)
+
+
+def _garmin_connect2_trace(uid: str, message: str) -> None:
+    uid_short = (uid[:8] + "…") if len(uid) > 8 else uid
+    logger.bind(garmin_comms=True).info(f"connect2: {message} uid={uid_short}")
+
+
+def _garmin_connect2_build_client() -> "GarthClient":
+    if GarthClient is None:
+        raise RuntimeError("garth.http.Client non disponibile")
+    timeout = max(15, int(os.getenv("GARMIN_CONNECT2_TIMEOUT_SEC", "30")))
+    retries = max(0, int(os.getenv("GARMIN_CONNECT2_RETRIES", "1")))
+    backoff = max(0.0, float(os.getenv("GARMIN_CONNECT2_BACKOFF_SEC", "1.0")))
+    return GarthClient(
+        timeout=timeout,
+        retries=retries,
+        backoff_factor=backoff,
+        status_forcelist=(408, 500, 502, 503, 504),
+        pool_connections=1,
+        pool_maxsize=1,
+    )
+
+
+def _garmin_connect2_finalize_success(
+    uid: str,
+    email: str,
+    client: "GarthClient",
+    *,
+    login_mode: str,
+) -> dict:
+    token_b64 = client.dumps()
+    _save_garmin_token_to_firestore(uid, token_b64)
+    db.collection("users").document(uid).set(
+        {
+            "garmin_linked": True,
+            "garmin_linked_at": datetime.utcnow().isoformat(),
+            "garmin_last_email": email,
+            "garmin_connect_method": login_mode,
+            "garmin_sso_rate_limited_until": None,
+            "garmin_sso_rate_limited_reason": None,
+        },
+        merge=True,
+        timeout=_firestore_timeout_sec(),
+    )
+    _garmin_connect2_trace(uid, f"login completato e token salvato ({login_mode})")
+    return {
+        "success": True,
+        "message": (
+            "Garmin collegato. Token salvato sul server. "
+            "La sincronizzazione dei dati puo' essere avviata separatamente."
+        ),
+    }
 
 
 def _run_scheduled_sync():
@@ -706,6 +778,18 @@ class GarminConnectRequest(BaseModel):
     password: str
     fresh_login: bool = False
 
+
+class GarminConnect2StartRequest(BaseModel):
+    uid: str
+    email: str
+    password: str
+
+
+class GarminConnect2VerifyRequest(BaseModel):
+    uid: str
+    login_session_id: str
+    mfa_code: str
+
 class GarminSyncRequest(BaseModel):
     uid: str
 
@@ -1112,6 +1196,199 @@ async def connect_garmin(
             status_code=500,
             detail=_truncate_http_detail(f"{type(e).__name__}: {e}", 800),
         )
+
+
+@app.post("/garmin/connect2/start")
+async def connect_garmin2_start(
+    req: GarminConnect2StartRequest,
+    _: None = Depends(verify_optional_bearer),
+):
+    """Login Garmin diretto con garth, senza riuso token e con MFA a due step."""
+    _require_db()
+    uid = req.uid.strip()
+    _garmin_connect2_cleanup_pending_sessions()
+    _garmin_connect2_trace(uid, "start richiesto")
+    try:
+        _garmin_connect_pauses(phase="pre_lock")
+        with _garmin_sso_password_lock:
+            client = _garmin_connect2_build_client()
+            _garmin_connect2_trace(
+                uid,
+                f"client creato timeout={client.timeout}s retries={client.retries}",
+            )
+            _garmin_connect_pauses(phase="before_login")
+            result = client.login(
+                req.email.strip(),
+                req.password,
+                return_on_mfa=True,
+                prompt_mfa=None,
+            )
+
+        if (
+            isinstance(result, tuple)
+            and len(result) == 2
+            and result[0] == "needs_mfa"
+            and isinstance(result[1], dict)
+        ):
+            session_id = uuid.uuid4().hex
+            ttl_minutes = max(
+                5,
+                int(os.getenv("GARMIN_CONNECT2_MFA_TTL_MINUTES", "10")),
+            )
+            expires_at = datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)
+            with _garmin_connect2_pending_lock:
+                _garmin_connect2_pending_sessions[session_id] = {
+                    "uid": uid,
+                    "email": req.email.strip(),
+                    "client_state": result[1],
+                    "expires_at": expires_at,
+                }
+            _garmin_connect2_trace(
+                uid,
+                f"MFA richiesta session_id={session_id[:8]} expires={expires_at.isoformat()}",
+            )
+            return {
+                "success": False,
+                "mfaRequired": True,
+                "loginSessionId": session_id,
+                "message": "Garmin richiede un codice MFA. Inseriscilo per completare il collegamento.",
+            }
+
+        _clear_garmin_sso_backoff(uid)
+        return _garmin_connect2_finalize_success(
+            uid,
+            req.email.strip(),
+            client,
+            login_mode="connect2_direct",
+        )
+    except GarthHTTPError as e:
+        detail = _truncate_http_detail(str(e))
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        _log_garmin_comms(
+            "connect_garmin2.garth_http",
+            uid,
+            e,
+            extra=f"mapped_status={status}",
+        )
+        if status == 429 or _garmin_error_text_looks_like_rate_limit(detail):
+            _register_garmin_sso_backoff(
+                uid,
+                reason=f"connect2_garth_http_{status or 'text_429'}",
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=detail or str(e),
+                headers={"Retry-After": _garmin_sso_retry_after_header_value()},
+            )
+        if status in (401, 403):
+            raise HTTPException(status_code=401, detail=detail or str(e))
+        raise HTTPException(status_code=502, detail=detail or str(e))
+    except GarthException as e:
+        detail = _truncate_http_detail(str(e))
+        _log_garmin_comms("connect_garmin2.garth_other", uid, e)
+        if _garmin_error_text_looks_like_rate_limit(detail):
+            _register_garmin_sso_backoff(
+                uid,
+                reason="connect2_garth_exception_429_text",
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=detail or str(e),
+                headers={"Retry-After": _garmin_sso_retry_after_header_value()},
+            )
+        if "unexpected title" in (detail or "").lower():
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Garmin non ha completato il login standard. "
+                    "Potrebbe servire MFA o una verifica extra lato Garmin."
+                ),
+            )
+        raise HTTPException(status_code=502, detail=detail or str(e))
+    except Exception as e:
+        fe = _http_exception_if_firestore_error(e)
+        if fe is not None:
+            _log_garmin_comms("connect_garmin2.firestore", uid, e)
+            raise fe
+        _log_garmin_comms("connect_garmin2.unexpected", uid, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/garmin/connect2/verify-mfa")
+async def connect_garmin2_verify_mfa(
+    req: GarminConnect2VerifyRequest,
+    _: None = Depends(verify_optional_bearer),
+):
+    _require_db()
+    uid = req.uid.strip()
+    _garmin_connect2_cleanup_pending_sessions()
+    with _garmin_connect2_pending_lock:
+        pending = _garmin_connect2_pending_sessions.get(req.login_session_id)
+    if pending is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Sessione MFA scaduta o non trovata. Riavvia Garmin Connect 2.",
+        )
+    if pending.get("uid") != uid:
+        raise HTTPException(status_code=403, detail="Sessione MFA non valida per questo utente.")
+
+    try:
+        client_state = pending["client_state"]
+        client = client_state["client"]
+        with _garmin_sso_password_lock:
+            client.resume_login(client_state, req.mfa_code.strip())
+        _clear_garmin_sso_backoff(uid)
+        return _garmin_connect2_finalize_success(
+            uid,
+            str(pending.get("email") or ""),
+            client,
+            login_mode="connect2_mfa",
+        )
+    except GarthHTTPError as e:
+        detail = _truncate_http_detail(str(e))
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        _log_garmin_comms(
+            "connect_garmin2.verify_mfa.garth_http",
+            uid,
+            e,
+            extra=f"mapped_status={status}",
+        )
+        if status == 429 or _garmin_error_text_looks_like_rate_limit(detail):
+            _register_garmin_sso_backoff(
+                uid,
+                reason=f"connect2_verify_mfa_{status or 'text_429'}",
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=detail or str(e),
+                headers={"Retry-After": _garmin_sso_retry_after_header_value()},
+            )
+        raise HTTPException(status_code=401, detail=detail or str(e))
+    except GarthException as e:
+        detail = _truncate_http_detail(str(e))
+        _log_garmin_comms("connect_garmin2.verify_mfa.garth_other", uid, e)
+        if _garmin_error_text_looks_like_rate_limit(detail):
+            _register_garmin_sso_backoff(uid, reason="connect2_verify_mfa_text_429")
+            raise HTTPException(
+                status_code=429,
+                detail=detail or str(e),
+                headers={"Retry-After": _garmin_sso_retry_after_header_value()},
+            )
+        raise HTTPException(
+            status_code=401,
+            detail=detail or "Codice MFA non valido o flusso Garmin non completato.",
+        )
+    except Exception as e:
+        fe = _http_exception_if_firestore_error(e)
+        if fe is not None:
+            _log_garmin_comms("connect_garmin2.verify_mfa.firestore", uid, e)
+            raise fe
+        _log_garmin_comms("connect_garmin2.verify_mfa.unexpected", uid, e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        with _garmin_connect2_pending_lock:
+            _garmin_connect2_pending_sessions.pop(req.login_session_id, None)
+
 
 # === ENDPOINT SYNC IMMEDIATA (pull-to-refresh / login app) ===
 @app.post("/garmin/sync")
