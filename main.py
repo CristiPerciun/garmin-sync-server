@@ -59,7 +59,7 @@ from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
-from typing import Annotated
+from typing import Annotated, Any
 
 import strava_sync
 
@@ -1548,6 +1548,7 @@ async def garmin_activity_detail(
             )
             start_dt = _parse_datetime(start_raw) or datetime.utcnow()
             act_id = str(detail.get("activityId") or detail.get("activityID") or req.garmin_activity_id)
+            full_activity = _merge_garmin_connect_extensions_into_activity(client, detail)
             doc_id = f"garmin_{act_id}"
             ref = (
                 db.collection("users")
@@ -1557,7 +1558,11 @@ async def garmin_activity_detail(
             )
             existing_snap = ref.get(timeout=_firestore_timeout_sec()).to_dict()
             merged = _build_unified_garmin_doc(
-                doc_id, detail, start_dt, existing_snap, list_mode=False
+                doc_id,
+                full_activity,
+                start_dt,
+                existing_snap,
+                list_mode=False,
             )
             changed = _write_activity_if_changed(uid, doc_id, merged)
             if changed:
@@ -1648,7 +1653,7 @@ def _firestore_safe_raw(obj: dict | None, max_depth: int = 3) -> dict | None:
     return out if out else None
 
 
-# Chiavi Garmin incluse in garmin_raw per sync leggera (lista / pull); dettaglio full da get_activity + /garmin/activity-detail
+# Chiavi Garmin incluse in garmin_raw per sync leggera (lista / pull); dettaglio completo (lap, split, …) da /garmin/activity-detail
 _GARMIN_LIST_RAW_KEYS = (
     "activityId",
     "activityID",
@@ -1680,6 +1685,149 @@ def _garmin_list_summary_raw(act: dict) -> dict | None:
     if isinstance(at, dict):
         out["activityType"] = at
     return _firestore_safe_raw(out, max_depth=4)
+
+
+# Chiavi con payload molto grande (GPS, grafici) — escluse dal salvataggio arricchito.
+_GARMIN_ENRICHMENT_STRIP_KEYS = frozenset(
+    {
+        "polyline",
+        "clippedPolyline",
+        "summarizedPolyline",
+        "polylineMap",
+        "latitudeLongitudeDTOs",
+        "mapLatitudeLongitudeList",
+        "chartData",
+    }
+)
+
+# Sotto-mappa unica dentro garmin_raw: risposte extra Connect (split, lap, zone, …)
+GARMIN_CONNECT_EXTENSIONS_KEY = "connectExtensions"
+
+
+def _firestore_safe_enrichment(
+    obj: Any,
+    *,
+    max_depth: int = 16,
+    max_list_len: int = 800,
+    max_str_len: int = 20000,
+) -> Any:
+    """Serializza JSON Garmin (lap, split, dettagli) per Firestore: mappe annidate e array di mappe ok, con limiti."""
+    if max_depth <= 0:
+        return None
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+    if isinstance(obj, str):
+        if len(obj) > max_str_len:
+            return f"{obj[:max_str_len]}…"
+        return obj
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            if k in _GARMIN_ENRICHMENT_STRIP_KEYS:
+                continue
+            nested = _firestore_safe_enrichment(
+                v,
+                max_depth=max_depth - 1,
+                max_list_len=max_list_len,
+                max_str_len=max_str_len,
+            )
+            if nested is not None:
+                out[k] = nested
+        return out
+    if isinstance(obj, list):
+        chunk = obj if len(obj) <= max_list_len else obj[:max_list_len]
+        out_list: list[Any] = []
+        for item in chunk:
+            nested = _firestore_safe_enrichment(
+                item,
+                max_depth=max_depth - 1,
+                max_list_len=max_list_len,
+                max_str_len=max_str_len,
+            )
+            out_list.append(nested)
+        return out_list
+    return None
+
+
+def _garmin_try_extension(aid: str, label: str, fn):
+    try:
+        data = fn()
+    except (GarthHTTPError, GarminConnectConnectionError, ValueError, TypeError) as e:
+        logger.debug(f"Garmin connectExtensions.{label} attivita {aid}: {e}")
+        return None
+    except Exception as e:
+        logger.debug(f"Garmin connectExtensions.{label} attivita {aid}: {e}")
+        return None
+    if data is None:
+        return None
+    if isinstance(data, dict) and not data:
+        return None
+    if isinstance(data, list) and not data:
+        return None
+    return data
+
+
+def _inject_derived_lap_pace(splits_root: Any) -> None:
+    """Aggiunge paceMinPerKm ai lap se Garmin espone distance (m) e duration (s)."""
+    if not isinstance(splits_root, dict):
+        return
+    laps = (
+        splits_root.get("lapDTOs")
+        or splits_root.get("laps")
+        or splits_root.get("lapList")
+    )
+    if not isinstance(laps, list):
+        return
+    for lap in laps:
+        if not isinstance(lap, dict):
+            continue
+        if lap.get("paceMinPerKm") is not None:
+            continue
+        dist = lap.get("distance")
+        dur = lap.get("duration") or lap.get("elapsedDuration") or lap.get("movingDuration")
+        if not isinstance(dist, (int, float)) or not isinstance(dur, (int, float)):
+            continue
+        if dist <= 1 or dur <= 0:
+            continue
+        km = dist / 1000.0
+        lap["paceMinPerKm"] = round((dur / 60.0) / km, 3)
+
+
+def _garmin_fetch_connect_extensions(client: Garmin, activity_id: str) -> dict[str, Any]:
+    """Dati aggiuntivi Connect (lap, fasi, zone, meteo, …) da fondere in garmin_raw."""
+    aid = str(activity_id)
+    out: dict[str, Any] = {}
+    pairs = (
+        ("splits", lambda: client.get_activity_splits(aid)),
+        ("typedSplits", lambda: client.get_activity_typed_splits(aid)),
+        ("splitSummaries", lambda: client.get_activity_split_summaries(aid)),
+        ("activityDetails", lambda: client.get_activity_details(aid, maxchart=200, maxpoly=0)),
+        ("hrTimeInZones", lambda: client.get_activity_hr_in_timezones(aid)),
+        ("powerTimeInZones", lambda: client.get_activity_power_in_timezones(aid)),
+        ("weather", lambda: client.get_activity_weather(aid)),
+        ("exerciseSets", lambda: client.get_activity_exercise_sets(aid)),
+    )
+    for label, fn in pairs:
+        data = _garmin_try_extension(aid, label, fn)
+        if data is not None:
+            out[label] = data
+    if "splits" in out:
+        _inject_derived_lap_pace(out["splits"])
+    if "typedSplits" in out:
+        _inject_derived_lap_pace(out["typedSplits"])
+    return out
+
+
+def _merge_garmin_connect_extensions_into_activity(client: Garmin, act: dict) -> dict:
+    """Copia attività + sotto-mappa connectExtensions con tutto ciò che l'API restituisce."""
+    merged: dict[str, Any] = dict(act)
+    aid = str(merged.get("activityId") or merged.get("activityID") or "")
+    if not aid:
+        return merged
+    ext = _garmin_fetch_connect_extensions(client, aid)
+    if ext:
+        merged[GARMIN_CONNECT_EXTENSIONS_KEY] = ext
+    return merged
 
 
 def _norm_cmp_val(v):
@@ -1919,15 +2067,16 @@ def _build_unified_garmin_doc(
     has_strava = _existing_has_strava(existing)
     strava_raw = existing.get("strava_raw") if existing else None
 
-    garmin_raw_out = (
-        _garmin_list_summary_raw(act) if list_mode else _firestore_safe_raw(act)
-    )
+    if list_mode:
+        garmin_raw_out = _garmin_list_summary_raw(act)
+    else:
+        garmin_raw_out = _firestore_safe_enrichment(act)
+        if garmin_raw_out is None:
+            garmin_raw_out = _firestore_safe_raw(act, max_depth=6)
     if has_strava:
         raw_out = _firestore_safe_raw(strava_raw) if strava_raw else None
     else:
-        raw_out = (
-            _garmin_list_summary_raw(act) if list_mode else _firestore_safe_raw(act)
-        )
+        raw_out = garmin_raw_out
 
     return {
         "id": doc_id,
