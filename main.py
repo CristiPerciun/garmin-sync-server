@@ -64,7 +64,7 @@ from typing import Annotated, Any
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.6"
+SERVER_VERSION = "1.1.7"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -160,6 +160,66 @@ def _extract_service_ticket(raw: str) -> str | None:
     if m:
         return m.group(1)
     return None
+
+
+def _extract_login_url_from_ticket_url(ticket_or_url: str) -> str:
+    """Estrae il service/login URL dal ticket_or_url (rimuove solo ?ticket=...).
+
+    Garmin valida che il ticket sia stato emesso per l'esatto login-url passato a
+    connectapi.garmin.com/oauth-service/oauth/preauthorized. Se il client ha usato
+    `service=https://localhost/garmin_oauth_return.html` (web popup), dobbiamo passare
+    QUELL'URL come login-url; se ha usato `sso.garmin.com/sso/embed` (native), usiamo quello.
+    """
+    _default = "https://sso.garmin.com/sso/embed"
+    raw = (ticket_or_url or "").strip()
+    if not raw or raw.startswith("ST-"):
+        return _default
+    try:
+        from urllib.parse import urlparse, urlencode, urlunsplit, parse_qs
+        parsed = urlparse(raw)
+        other_params = {
+            k: v[0]
+            for k, v in parse_qs(parsed.query).items()
+            if k != "ticket"
+        }
+        new_query = urlencode(other_params) if other_params else ""
+        base = urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, new_query, "")
+        ).rstrip("?")
+        return base or _default
+    except Exception:
+        return _default
+
+
+def _get_oauth1_token_with_login_url(ticket: str, client, login_url: str):
+    """Come garth_sso.get_oauth1_token ma con login-url personalizzato.
+
+    Necessario quando il ticket CAS è stato emesso per un service URL diverso da
+    https://sso.garmin.com/sso/embed (es. web popup con garmin_oauth_return.html).
+    Garmin valida che login-url corrisponda al service URL del ticket.
+    """
+    from garth.sso import GarminOAuth1Session, OAuth1Token
+    from urllib.parse import parse_qs
+
+    # USER_AGENT potrebbe non essere esportato in tutte le versioni di garth.
+    try:
+        from garth.sso import USER_AGENT
+    except ImportError:
+        USER_AGENT = {"User-Agent": "GCM-iOS-5.7.2.1 (com.garmin.connect.mobile)"}
+
+    sess = GarminOAuth1Session(parent=client.sess)
+    base_url = f"https://connectapi.{client.domain}/oauth-service/oauth/"
+    url = (
+        f"{base_url}preauthorized"
+        f"?ticket={ticket}"
+        f"&login-url={login_url}"
+        "&accepts-mfa-tokens=true"
+    )
+    resp = sess.get(url, headers=USER_AGENT, timeout=client.timeout)
+    resp.raise_for_status()
+    parsed = parse_qs(resp.text)
+    token_data = {k: v[0] for k, v in parsed.items()}
+    return OAuth1Token(domain=client.domain, **token_data)
 
 
 def _run_scheduled_sync():
@@ -1089,10 +1149,16 @@ async def connect_garmin3_exchange_ticket(
                 "https://sso.garmin.com/sso/embed?ticket=... oppure il valore ST-..."
             ),
         )
-    _garmin_connect2_trace(uid, f"connect3 exchange richiesto ticket={ticket[:12]}...")
+    login_url = _extract_login_url_from_ticket_url(req.ticket_or_url)
+    _garmin_connect2_trace(
+        uid,
+        f"connect3 exchange richiesto ticket={ticket[:12]}... login-url={login_url}",
+    )
     try:
         client = _garmin_connect2_build_client()
-        oauth1 = garth_sso.get_oauth1_token(ticket, client)
+        # Usa login-url estratto dal ticket_or_url: deve corrispondere al service URL
+        # con cui il ticket è stato emesso (validazione CAS lato Garmin).
+        oauth1 = _get_oauth1_token_with_login_url(ticket, client, login_url)
         oauth2 = garth_sso.exchange(oauth1, client)
         client.configure(
             oauth1_token=oauth1,
