@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import secrets
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -64,7 +65,7 @@ from typing import Annotated, Any
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.8"
+SERVER_VERSION = "1.1.9"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -819,6 +820,15 @@ class GarminConnect3ExchangeRequest(BaseModel):
     email: str | None = None
 
 
+class GarminWebSsoPrepareRequest(BaseModel):
+    uid: str
+
+
+class GarminConnect3ExchangeWithStateRequest(BaseModel):
+    state: str
+    ticket_or_url: str
+
+
 class GarminSyncRequest(BaseModel):
     uid: str
 
@@ -1142,14 +1152,32 @@ async def connect_garmin2_verify_mfa(
             _garmin_connect2_pending_sessions.pop(req.login_session_id, None)
 
 
-@app.post("/garmin/connect3/exchange-ticket")
-async def connect_garmin3_exchange_ticket(
-    req: GarminConnect3ExchangeRequest,
-    _: None = Depends(verify_optional_bearer),
-):
-    _require_db()
-    uid = req.uid.strip()
-    ticket = _extract_service_ticket(req.ticket_or_url)
+def _public_exchange_origin(request: Request) -> str:
+    """URL pubblico del mini-server (HTTPS) restituito alla web app per fetch post-login."""
+    explicit = (os.getenv("PUBLIC_SERVER_URL") or "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    try:
+        u = str(request.base_url).rstrip("/")
+        if u.startswith("http://") or u.startswith("https://"):
+            return u
+    except Exception:
+        pass
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Configura PUBLIC_SERVER_URL sul server (URL pubblico HTTPS raggiungibile dal browser, "
+            "es. https://sync.esempio.com) per completare Garmin OAuth dalla web app."
+        ),
+    )
+
+
+def _exchange_garmin_connect3_ticket_or_raise(
+    uid: str,
+    ticket_or_url: str,
+    email: str | None = None,
+) -> dict:
+    ticket = _extract_service_ticket(ticket_or_url)
     if not ticket:
         raise HTTPException(
             status_code=400,
@@ -1158,15 +1186,13 @@ async def connect_garmin3_exchange_ticket(
                 "https://sso.garmin.com/sso/embed?ticket=... oppure il valore ST-..."
             ),
         )
-    login_url = _extract_login_url_from_ticket_url(req.ticket_or_url)
+    login_url = _extract_login_url_from_ticket_url(ticket_or_url)
     _garmin_connect2_trace(
         uid,
         f"connect3 exchange richiesto ticket={ticket[:12]}... login-url={login_url}",
     )
     try:
         client = _garmin_connect2_build_client()
-        # Usa login-url estratto dal ticket_or_url: deve corrispondere al service URL
-        # con cui il ticket è stato emesso (validazione CAS lato Garmin).
         oauth1 = _get_oauth1_token_with_login_url(ticket, client, login_url)
         oauth2 = garth_sso.exchange(oauth1, client)
         client.configure(
@@ -1177,7 +1203,7 @@ async def connect_garmin3_exchange_ticket(
         _clear_garmin_sso_backoff(uid)
         return _garmin_connect2_finalize_success(
             uid,
-            (req.email or "").strip(),
+            (email or "").strip(),
             client,
             login_mode="connect3_ticket",
         )
@@ -1224,6 +1250,70 @@ async def connect_garmin3_exchange_ticket(
                 ),
             )
         raise HTTPException(status_code=502, detail=detail)
+
+
+@app.post("/garmin/connect3/web-sso/prepare")
+async def garmin_web_sso_prepare(
+    req: GarminWebSsoPrepareRequest,
+    request: Request,
+    _: None = Depends(verify_optional_bearer),
+):
+    """Crea uno state monouso (Firestore) per OAuth web: uid non viaggia nel redirect Garmin."""
+    _require_db()
+    uid = req.uid.strip()
+    state = secrets.token_urlsafe(32)
+    origin = _public_exchange_origin(request)
+    db.collection("garmin_web_sso_pending").document(state).set(
+        {"uid": uid, "created_at": firestore.SERVER_TIMESTAMP},
+        timeout=_firestore_timeout_sec(),
+    )
+    return {"success": True, "state": state, "public_origin": origin}
+
+
+@app.post("/garmin/connect3/exchange-ticket-with-state")
+async def connect_garmin3_exchange_ticket_with_state(
+    req: GarminConnect3ExchangeWithStateRequest,
+    _: None = Depends(verify_optional_bearer),
+):
+    _require_db()
+    state = req.state.strip()
+    if len(state) < 8:
+        raise HTTPException(status_code=400, detail="Parametro state OAuth non valido.")
+    snap_ref = db.collection("garmin_web_sso_pending").document(state)
+    snap = snap_ref.get(timeout=_firestore_timeout_sec())
+    if not snap.exists:
+        raise HTTPException(
+            status_code=400,
+            detail="Sessione OAuth web Garmin scaduta o già usata. Riprova da Impostazioni.",
+        )
+    data = snap.to_dict() or {}
+    uid = (data.get("uid") or "").strip()
+    if not uid:
+        try:
+            snap_ref.delete(timeout=_firestore_timeout_sec())
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail="Sessione OAuth web Garmin non valida.")
+    out = _exchange_garmin_connect3_ticket_or_raise(uid, req.ticket_or_url, None)
+    try:
+        snap_ref.delete(timeout=_firestore_timeout_sec())
+    except Exception as ex:
+        logger.warning(f"garmin_web_sso_pending delete fallita state={state[:8]}...: {ex}")
+    return out
+
+
+@app.post("/garmin/connect3/exchange-ticket")
+async def connect_garmin3_exchange_ticket(
+    req: GarminConnect3ExchangeRequest,
+    _: None = Depends(verify_optional_bearer),
+):
+    _require_db()
+    uid = req.uid.strip()
+    return _exchange_garmin_connect3_ticket_or_raise(
+        uid,
+        req.ticket_or_url,
+        req.email,
+    )
 
 
 # === ENDPOINT SYNC IMMEDIATA (pull-to-refresh / login app) ===
