@@ -64,7 +64,7 @@ from typing import Annotated, Any
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.7"
+SERVER_VERSION = "1.1.8"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -197,9 +197,15 @@ def _get_oauth1_token_with_login_url(ticket: str, client, login_url: str):
     Necessario quando il ticket CAS è stato emesso per un service URL diverso da
     https://sso.garmin.com/sso/embed (es. web popup con garmin_oauth_return.html).
     Garmin valida che login-url corrisponda al service URL del ticket.
+
+    Importante: `login_url` può contenere query string (es. `?uid=...&base_url=...`
+    quando il flusso web iOS PWA usa garmin_oauth_return.html con parametri).
+    Senza URL-encoding, i caratteri `?` e `&` nel valore di `login-url` verrebbero
+    interpretati da Garmin come ulteriori parametri della preauthorized request,
+    troncando il login-url e causando mismatch col service URL originale.
     """
     from garth.sso import GarminOAuth1Session, OAuth1Token
-    from urllib.parse import parse_qs
+    from urllib.parse import parse_qs, quote
 
     # USER_AGENT potrebbe non essere esportato in tutte le versioni di garth.
     try:
@@ -209,10 +215,13 @@ def _get_oauth1_token_with_login_url(ticket: str, client, login_url: str):
 
     sess = GarminOAuth1Session(parent=client.sess)
     base_url = f"https://connectapi.{client.domain}/oauth-service/oauth/"
+    # quote(safe="") encoda anche `?`, `&`, `=`, `/`, `:` per garantire che
+    # tutto il valore venga ricevuto da Garmin come singolo parametro login-url.
+    encoded_login_url = quote(login_url, safe="")
     url = (
         f"{base_url}preauthorized"
         f"?ticket={ticket}"
-        f"&login-url={login_url}"
+        f"&login-url={encoded_login_url}"
         "&accepts-mfa-tokens=true"
     )
     resp = sess.get(url, headers=USER_AGENT, timeout=client.timeout)
