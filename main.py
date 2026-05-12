@@ -2,6 +2,7 @@ import json
 import os
 import re
 import secrets
+from urllib.parse import quote, urlencode, urlparse, urlunparse
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -59,13 +60,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import RedirectResponse
 from pydantic import BaseModel
 from typing import Annotated, Any
 
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.1.8"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -793,6 +795,8 @@ def verify_optional_bearer(
     """Se GARMIN_SERVER_BEARER_TOKEN è impostato, richiede Authorization: Bearer …"""
     if request.url.path.startswith("/internal/"):
         return
+    if request.url.path == "/garmin/connect3/web-sso/cas-callback":
+        return
     expected = (os.getenv("GARMIN_SERVER_BEARER_TOKEN") or "").strip()
     if not expected:
         return
@@ -822,6 +826,108 @@ class GarminConnect3ExchangeRequest(BaseModel):
 
 class GarminWebSsoPrepareRequest(BaseModel):
     uid: str
+    app_return_base: str | None = None
+
+
+def _normalize_app_return_base(url: str) -> str:
+    s = url.strip().rstrip("/") + "/"
+    return s
+
+
+def _validate_app_return_base(url: str) -> str:
+    """Verifica policy redirect; ritorna base con slash finale."""
+    u = url.strip()
+    if not u:
+        raise HTTPException(
+            status_code=400,
+            detail="app_return_base vuoto. Impostalo nel client o FITAI_WEB_APP_DEFAULT_RETURN_BASE sul server.",
+        )
+    parsed = urlparse(u)
+    if not parsed.scheme or not parsed.netloc:
+        raise HTTPException(
+            status_code=400,
+            detail="app_return_base deve essere un URL assoluto (es. https://…/FitAI-Analyzer/).",
+        )
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if scheme == "https":
+        pass
+    elif scheme == "http" and host in (
+        "localhost",
+        "127.0.0.1",
+        "[::1]",
+    ):
+        pass
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="app_return_base: consentito https ovunque, o http solo su localhost.",
+        )
+    path = parsed.path or "/"
+    normalized = urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+    out = _normalize_app_return_base(normalized)
+    allow_raw = (os.getenv("FITAI_WEB_APP_ORIGIN_ALLOWLIST") or "").strip()
+    if allow_raw:
+        prefixes: list[str] = []
+        for part in allow_raw.split(","):
+            p = part.strip()
+            if p:
+                prefixes.append(_normalize_app_return_base(p).lower())
+        olow = out.lower()
+        if not any(olow.startswith(pref) for pref in prefixes):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "app_return_base non è nella FITAI_WEB_APP_ORIGIN_ALLOWLIST "
+                    "configurata sul server."
+                ),
+            )
+        return out
+    if host in ("localhost", "127.0.0.1", "[::1]") or host.endswith(".localhost"):
+        return out
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Per OAuth web su hosting pubblico imposta FITAI_WEB_APP_ORIGIN_ALLOWLIST sul Pi "
+            "(es. https://tuo-id.github.io/FitAI-Analyzer/). "
+            "Vedi note deploy garmin-sync-server."
+        ),
+    )
+
+
+def _resolve_app_return_base_for_prepare(client_value: str | None) -> str:
+    raw = (client_value or "").strip()
+    if not raw:
+        raw = (os.getenv("FITAI_WEB_APP_DEFAULT_RETURN_BASE") or "").strip()
+    return _validate_app_return_base(raw)
+
+
+def _garmin_sso_redirect_to_app(
+    app_base: str,
+    *,
+    ok: bool = False,
+    err_message: str | None = None,
+) -> RedirectResponse:
+    base = _normalize_app_return_base(app_base)
+    q: dict[str, str] = {}
+    if ok:
+        q["garmin_oauth"] = "ok"
+    if err_message:
+        q["garmin_oauth_err"] = err_message[:900]
+    url = base.rstrip("/") + "/"
+    if q:
+        url = url + "?" + urlencode(q, quote_via=quote)
+    return RedirectResponse(url=url, status_code=302)
+
+
+def _http_exception_detail_str(exc: HTTPException) -> str:
+    d = exc.detail
+    if isinstance(d, str):
+        return d[:900]
+    try:
+        return str(d)[:900]
+    except Exception:
+        return "Errore server"
 
 
 class GarminConnect3ExchangeWithStateRequest(BaseModel):
@@ -1263,15 +1369,106 @@ async def garmin_web_sso_prepare(
     uid = req.uid.strip()
     state = secrets.token_urlsafe(32)
     origin = _public_exchange_origin(request)
+    app_base = _resolve_app_return_base_for_prepare(req.app_return_base)
     db.collection("garmin_web_sso_pending").document(state).set(
         {
             "uid": uid,
             "public_origin": origin,
+            "app_return_base": app_base,
             "created_at": firestore.SERVER_TIMESTAMP,
         },
         timeout=_firestore_timeout_sec(),
     )
     return {"success": True, "state": state, "public_origin": origin}
+
+
+@app.get("/garmin/connect3/web-sso/cas-callback")
+async def garmin_web_sso_cas_callback(
+    request: Request,
+    state: str,
+    ticket: str | None = None,
+    error: str | None = None,
+):
+    """Garmin CAS reindirizza qui (GET) con service= questa URL; poi 302 verso la web app."""
+    _require_db()
+    state = state.strip()
+    default_fallback = (os.getenv("FITAI_WEB_APP_DEFAULT_RETURN_BASE") or "").strip()
+
+    def safe_redirect_err(msg: str, app_base_hint: str | None = None) -> RedirectResponse:
+        for candidate in (app_base_hint, default_fallback):
+            if not candidate or not str(candidate).strip():
+                continue
+            try:
+                b = _validate_app_return_base(str(candidate).strip())
+            except HTTPException:
+                continue
+            return _garmin_sso_redirect_to_app(b, err_message=msg)
+        raise HTTPException(status_code=400, detail=msg)
+
+    if len(state) < 8:
+        return safe_redirect_err("Parametro state OAuth non valido.")
+
+    snap_ref = db.collection("garmin_web_sso_pending").document(state)
+    snap = snap_ref.get(timeout=_firestore_timeout_sec())
+    app_hint: str | None = None
+    if snap.exists:
+        app_hint = (snap.to_dict() or {}).get("app_return_base")
+        if app_hint is not None:
+            app_hint = str(app_hint).strip() or None
+
+    if not snap.exists:
+        return safe_redirect_err(
+            "Sessione OAuth scaduta o già usata. Riprova da Impostazioni.",
+            app_hint,
+        )
+
+    data = snap.to_dict() or {}
+    uid = (data.get("uid") or "").strip()
+    app_base_raw = (data.get("app_return_base") or "").strip()
+    if not app_base_raw:
+        app_base_raw = default_fallback
+    if not uid:
+        try:
+            snap_ref.delete(timeout=_firestore_timeout_sec())
+        except Exception:
+            pass
+        return safe_redirect_err("Sessione OAuth non valida.", app_base_raw or app_hint)
+
+    if error and str(error).strip():
+        try:
+            snap_ref.delete(timeout=_firestore_timeout_sec())
+        except Exception:
+            pass
+        return safe_redirect_err(f"Garmin: {error}", app_base_raw or app_hint)
+
+    ticket = (ticket or "").strip()
+    if not ticket:
+        return safe_redirect_err(
+            "Ticket Garmin mancante dopo il login SSO.",
+            app_base_raw or app_hint,
+        )
+
+    ticket_or_url = str(request.url)
+    try:
+        _exchange_garmin_connect3_ticket_or_raise(uid, ticket_or_url, None)
+    except HTTPException as he:
+        return safe_redirect_err(_http_exception_detail_str(he), app_base_raw or app_hint)
+    try:
+        snap_ref.delete(timeout=_firestore_timeout_sec())
+    except Exception as ex:
+        logger.warning(
+            f"garmin_web_sso_pending delete cas-callback fallita state={state[:8]}...: {ex}"
+        )
+    if not app_base_raw:
+        raise HTTPException(
+            status_code=500,
+            detail="app_return_base mancante: impostalo nel prepare o FITAI_WEB_APP_DEFAULT_RETURN_BASE.",
+        )
+    try:
+        app_base = _validate_app_return_base(app_base_raw)
+    except HTTPException:
+        app_base = _normalize_app_return_base(app_base_raw)
+    return _garmin_sso_redirect_to_app(app_base, ok=True)
 
 
 @app.get("/garmin/connect3/web-sso/pending-context")
