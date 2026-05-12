@@ -258,7 +258,7 @@ async def lifespan(app: FastAPI):
         logger.error(f"Firebase non disponibile: {e}")
         db = None
 
-    _allow_web = (os.getenv("https://cristiperciun.github.io/FitAI-Analyzer/") or "").strip()
+    _allow_web = (os.getenv("FITAI_WEB_APP_ORIGIN_ALLOWLIST") or "").strip()
     if _allow_web:
         _n = len([p for p in _allow_web.split(",") if p.strip()])
         logger.info(
@@ -888,7 +888,7 @@ def _validate_app_return_base(url: str) -> str:
     path = parsed.path or "/"
     normalized = urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
     out = _normalize_app_return_base(normalized)
-    allow_raw = (os.getenv("https://cristiperciun.github.io/FitAI-Analyzer/") or "").strip()
+    allow_raw = (os.getenv("FITAI_WEB_APP_ORIGIN_ALLOWLIST") or "").strip()
     if allow_raw:
         prefixes: list[str] = []
         for part in allow_raw.split(","):
@@ -985,11 +985,13 @@ class ActivityDetailRequest(BaseModel):
 # === HEALTH CHECK ===
 @app.get("/")
 def health():
+    _aw = (os.getenv("FITAI_WEB_APP_ORIGIN_ALLOWLIST") or "").strip()
     return {
         "status": "ok",
         "service": "garmin-sync-server",
         "firestore": db is not None,
         "version": SERVER_VERSION,
+        "oauth_web_allowlist_configured": bool(_aw),
     }
 
 def _extract_activities_list(raw) -> list:
