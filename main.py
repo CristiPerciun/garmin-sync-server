@@ -65,7 +65,7 @@ from typing import Annotated, Any
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.9"
+SERVER_VERSION = "1.2.0"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -1264,10 +1264,44 @@ async def garmin_web_sso_prepare(
     state = secrets.token_urlsafe(32)
     origin = _public_exchange_origin(request)
     db.collection("garmin_web_sso_pending").document(state).set(
-        {"uid": uid, "created_at": firestore.SERVER_TIMESTAMP},
+        {
+            "uid": uid,
+            "public_origin": origin,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        },
         timeout=_firestore_timeout_sec(),
     )
     return {"success": True, "state": state, "public_origin": origin}
+
+
+@app.get("/garmin/connect3/web-sso/pending-context")
+async def garmin_web_sso_pending_context(
+    state: str,
+    _: None = Depends(verify_optional_bearer),
+):
+    """Usato da `garmin_oauth_return.html` se sessionStorage iOS/PWA non ha `gx_api`."""
+    _require_db()
+    state = state.strip()
+    if len(state) < 8:
+        raise HTTPException(status_code=400, detail="Parametro state non valido.")
+    snap = db.collection("garmin_web_sso_pending").document(state).get(
+        timeout=_firestore_timeout_sec(),
+    )
+    if not snap.exists:
+        raise HTTPException(
+            status_code=404,
+            detail="Sessione non trovata o già usata. Riprova da Impostazioni.",
+        )
+    data = snap.to_dict() or {}
+    po = (data.get("public_origin") or "").strip().rstrip("/")
+    if not po:
+        po = (os.getenv("PUBLIC_SERVER_URL") or "").strip().rstrip("/")
+    if not po:
+        raise HTTPException(
+            status_code=503,
+            detail="public_origin non configurato sul server.",
+        )
+    return {"public_origin": po}
 
 
 @app.post("/garmin/connect3/exchange-ticket-with-state")
