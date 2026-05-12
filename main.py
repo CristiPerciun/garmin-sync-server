@@ -67,7 +67,7 @@ from typing import Annotated, Any
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.9"
+SERVER_VERSION = "1.1.11"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -257,6 +257,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Firebase non disponibile: {e}")
         db = None
+
+    _allow_web = (os.getenv("https://cristiperciun.github.io/FitAI-Analyzer/") or "").strip()
+    if _allow_web:
+        _n = len([p for p in _allow_web.split(",") if p.strip()])
+        logger.info(
+            f"OAuth web: FITAI_WEB_APP_ORIGIN_ALLOWLIST ok ({_n} prefissi), prepare da hosting pubblico consentito."
+        )
+    else:
+        logger.warning(
+            "OAuth web: FITAI_WEB_APP_ORIGIN_ALLOWLIST assente — "
+            "POST /garmin/connect3/web-sso/prepare da GitHub Pages risponde errore "
+            "(senza allowlist è consentito solo localhost). "
+            "Aggiungi la variabile nel .env sul Pi (vedi systemd EnvironmentFile) e riavvia il servizio."
+        )
 
     if env_flag_true("GARMIN_TRACE_UPSTREAM_HTTP"):
         import logging
@@ -874,7 +888,7 @@ def _validate_app_return_base(url: str) -> str:
     path = parsed.path or "/"
     normalized = urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
     out = _normalize_app_return_base(normalized)
-    allow_raw = (os.getenv("FITAI_WEB_APP_ORIGIN_ALLOWLIST") or "").strip()
+    allow_raw = (os.getenv("https://cristiperciun.github.io/FitAI-Analyzer/") or "").strip()
     if allow_raw:
         prefixes: list[str] = []
         for part in allow_raw.split(","):
