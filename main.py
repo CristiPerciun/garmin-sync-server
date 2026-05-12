@@ -67,7 +67,7 @@ from typing import Annotated, Any
 import strava_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.8"
+SERVER_VERSION = "1.1.9"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -834,6 +834,14 @@ def _normalize_app_return_base(url: str) -> str:
     return s
 
 
+def _fitai_web_app_public_example_url() -> str:
+    """Esempio mostrato nei messaggi guida OAuth web (env o default pubblico FitAI)."""
+    raw = (os.getenv("FITAI_WEB_APP_PUBLIC_EXAMPLE") or "").strip()
+    if raw:
+        return _normalize_app_return_base(raw)
+    return "https://cristiperciun.github.io/FitAI-Analyzer/"
+
+
 def _validate_app_return_base(url: str) -> str:
     """Verifica policy redirect; ritorna base con slash finale."""
     u = url.strip()
@@ -866,7 +874,7 @@ def _validate_app_return_base(url: str) -> str:
     path = parsed.path or "/"
     normalized = urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
     out = _normalize_app_return_base(normalized)
-    allow_raw = (os.getenv("https://cristiperciun.github.io/FitAI-Analyzer/") or "").strip()
+    allow_raw = (os.getenv("FITAI_WEB_APP_ORIGIN_ALLOWLIST") or "").strip()
     if allow_raw:
         prefixes: list[str] = []
         for part in allow_raw.split(","):
@@ -885,11 +893,13 @@ def _validate_app_return_base(url: str) -> str:
         return out
     if host in ("localhost", "127.0.0.1", "[::1]") or host.endswith(".localhost"):
         return out
+    ex = _fitai_web_app_public_example_url()
     raise HTTPException(
         status_code=400,
         detail=(
             "Per OAuth web su hosting pubblico imposta FITAI_WEB_APP_ORIGIN_ALLOWLIST sul Pi "
-            "(es. https://tuo-id.github.io/FitAI-Analyzer/). "
+            f"(es. {ex}). "
+            "Variabile opzionale di esempio nel messaggio: FITAI_WEB_APP_PUBLIC_EXAMPLE. "
             "Vedi note deploy garmin-sync-server."
         ),
     )
