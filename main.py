@@ -866,7 +866,7 @@ def _validate_app_return_base(url: str) -> str:
     path = parsed.path or "/"
     normalized = urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
     out = _normalize_app_return_base(normalized)
-    allow_raw = (os.getenv("FITAI_WEB_APP_ORIGIN_ALLOWLIST") or "").strip()
+    allow_raw = (os.getenv("https://cristiperciun.github.io/FitAI-Analyzer/") or "").strip()
     if allow_raw:
         prefixes: list[str] = []
         for part in allow_raw.split(","):
