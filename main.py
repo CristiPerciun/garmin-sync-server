@@ -896,7 +896,12 @@ def _validate_app_return_base(url: str) -> str:
             if p:
                 prefixes.append(_normalize_app_return_base(p).lower())
         olow = out.lower()
-        if not any(olow.startswith(pref) for pref in prefixes):
+        localhost_development = (
+            host in ("localhost", "127.0.0.1", "[::1]") or host.endswith(".localhost")
+        )
+        if not localhost_development and not any(
+            olow.startswith(pref) for pref in prefixes
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=(
