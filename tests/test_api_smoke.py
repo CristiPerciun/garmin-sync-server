@@ -26,3 +26,5 @@ def test_openapi_contains_new_paths():
         assert "/garmin/sync-today" in paths
         assert "/sync/delta" in paths
         assert "/strava/register-tokens" in paths
+        assert "/mi-fitness/connect" in paths
+        assert "/mi-fitness/disconnect" in paths

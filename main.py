@@ -65,9 +65,10 @@ from pydantic import BaseModel
 from typing import Annotated, Any
 
 import strava_sync
+import mi_fitness_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.14"
+SERVER_VERSION = "1.1.15"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -352,7 +353,10 @@ class GarminFlutterHttpTraceMiddleware(BaseHTTPMiddleware):
             + (f"?{q}" if q else "")
             + f" from={client_ip} ct={ct_in} auth={auth_in} bytes={len(body)}"
         )
-        if path.startswith("/garmin/connect") and body:
+        trace_connect = body and (
+            path.startswith("/garmin/connect") or path.startswith("/mi-fitness/connect")
+        )
+        if trace_connect:
             try:
                 jd = json.loads(body.decode("utf-8", errors="replace"))
                 keys = sorted(jd.keys()) if isinstance(jd, dict) else []
@@ -361,6 +365,7 @@ class GarminFlutterHttpTraceMiddleware(BaseHTTPMiddleware):
                 email_host = em.split("@")[-1].lower() if "@" in em else "?"
                 logger.bind(http_trace=True).debug(
                     f"rid={rid} connect_json keys={keys} uid_len={uid_len} email_host={email_host}"
+                    + (" (mi-fitness)" if "/mi-fitness/" in path else "")
                 )
             except Exception as ex:
                 logger.bind(http_trace=True).debug(f"rid={rid} connect_json non parsabile: {ex}")
@@ -767,6 +772,33 @@ def _delete_strava_tokens_from_firestore(uid: str) -> None:
     )
 
 
+MI_FITNESS_TOKENS_COLLECTION = "mi_fitness_tokens"
+
+
+def _save_mi_fitness_session_to_firestore(uid: str, session: dict[str, Any]) -> None:
+    db.collection(MI_FITNESS_TOKENS_COLLECTION).document(uid).set(
+        {
+            **session,
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+        merge=True,
+        timeout=_firestore_timeout_sec(),
+    )
+
+
+def _get_mi_fitness_session_from_firestore(uid: str) -> dict | None:
+    doc = db.collection(MI_FITNESS_TOKENS_COLLECTION).document(uid).get(
+        timeout=_firestore_timeout_sec(),
+    )
+    return doc.to_dict() if doc.exists else None
+
+
+def _delete_mi_fitness_session_from_firestore(uid: str) -> None:
+    db.collection(MI_FITNESS_TOKENS_COLLECTION).document(uid).delete(
+        timeout=_firestore_timeout_sec(),
+    )
+
+
 def _strava_client_configured() -> bool:
     cid = (os.getenv("STRAVA_CLIENT_ID") or "").strip()
     sec = (os.getenv("STRAVA_CLIENT_SECRET") or "").strip()
@@ -971,7 +1003,7 @@ class GarminSyncRequest(BaseModel):
 class DeltaSyncRequest(BaseModel):
     uid: str
     lastSuccessfulSync: int | float | str | dict | None = None
-    sources: list[str] = ["garmin", "strava"]
+    sources: list[str] = ["garmin", "strava", "mi_fitness"]
 
 
 class StravaRegisterRequest(BaseModel):
@@ -979,6 +1011,16 @@ class StravaRegisterRequest(BaseModel):
     access_token: str
     refresh_token: str
     expires_at: int | float | None = None
+
+
+class MiFitnessConnectRequest(BaseModel):
+    uid: str
+    email: str
+    password: str
+
+
+class MiFitnessDisconnectRequest(BaseModel):
+    uid: str
 
 
 class ActivityDetailRequest(BaseModel):
@@ -1716,6 +1758,13 @@ def _run_garmin_sync_today(uid: str) -> dict:
         pass
     if vitals_ok:
         _set_last_successful_sync(uid)
+    try:
+        udoc = db.collection("users").document(uid).get(timeout=_firestore_timeout_sec()).to_dict() or {}
+        if udoc.get("mi_fitness_linked"):
+            mi_since = datetime.now(timezone.utc) - timedelta(days=int(os.getenv("MI_FITNESS_SYNC_TODAY_LOOKBACK_DAYS", "3")))
+            _delta_mi_fitness(uid, mi_since)
+    except Exception as e:
+        logger.debug(f"sync-today mi_fitness addon: {e}")
     return sync_result
 
 
@@ -1790,6 +1839,44 @@ def _delta_strava(uid: str, last: datetime | None) -> int:
     return writes
 
 
+def _delta_mi_fitness(uid: str, last: datetime | None) -> int:
+    sess = _get_mi_fitness_session_from_firestore(uid)
+    if not sess:
+        return 0
+    token = str(sess.get("app_token") or "").strip()
+    if not token:
+        return 0
+    base = (sess.get("api_base") or mi_fitness_sync.DEFAULT_API_BASE).rstrip("/")
+    since = last or (datetime.now(timezone.utc) - timedelta(days=7))
+    since_ts = int(since.timestamp())
+    try:
+        rows = mi_fitness_sync.fetch_workout_summaries_paginated(
+            token,
+            api_base=base,
+            since_ts=since_ts,
+            max_summaries=min(3500, int(os.getenv("MI_FITNESS_DELTA_MAX_ROWS", "800"))),
+        )
+    except mi_fitness_sync.MiFitnessApiError as e:
+        logger.warning(f"delta mi_fitness API {uid[:8]}…: {e}")
+        return 0
+    writes = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            tr = int(str(row.get("trackid") or 0))
+            if tr < since_ts:
+                continue
+        except ValueError:
+            continue
+        try:
+            if _upsert_mi_fitness_activity(uid, row):
+                writes += 1
+        except Exception as e:
+            logger.debug(f"delta mi_fitness upsert: {e}")
+    return writes
+
+
 def _strava_backfill_worker(uid: str) -> None:
     if db is None:
         return
@@ -1840,6 +1927,71 @@ def _strava_backfill_worker(uid: str) -> None:
         _set_backfill_status(uid, "error", message=str(e)[:500], source="strava")
 
 
+def _mi_fitness_backfill_worker(uid: str) -> None:
+    if db is None:
+        return
+    try:
+        _set_backfill_status(
+            uid, "processing", progress=0.05, message="Mi Fitness backfill…", source="mi_fitness"
+        )
+        sess = _get_mi_fitness_session_from_firestore(uid)
+        if not sess:
+            _set_backfill_status(
+                uid, "error", message="Sessione Mi Fitness non disponibile", source="mi_fitness"
+            )
+            return
+        token = str(sess.get("app_token") or "").strip()
+        if not token:
+            _set_backfill_status(uid, "error", message="app_token mancante", source="mi_fitness")
+            return
+        base = (sess.get("api_base") or mi_fitness_sync.DEFAULT_API_BASE).rstrip("/")
+        days = int(os.getenv("BACKFILL_DAYS", "60"))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        since_ts = int(cutoff.timestamp())
+        rows = mi_fitness_sync.fetch_workout_summaries_paginated(
+            token,
+            api_base=base,
+            since_ts=None,
+            max_summaries=min(8000, int(os.getenv("MI_FITNESS_BACKFILL_MAX_ROWS", "5000"))),
+        )
+        n = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                tr = int(str(row.get("trackid") or 0))
+                if tr < since_ts:
+                    continue
+            except ValueError:
+                continue
+            try:
+                _upsert_mi_fitness_activity(uid, row)
+            except Exception as e:
+                logger.debug(f"mi_fitness backfill upsert: {e}")
+            n += 1
+            if n % 40 == 0:
+                _set_backfill_status(
+                    uid,
+                    "processing",
+                    progress=min(0.92, 0.08 + (n / 4000) * 0.8),
+                    message=f"Mi Fitness… ({n})",
+                    source="mi_fitness",
+                )
+        db.collection("users").document(uid).set(
+            {"mi_fitness_initial_sync_done": True},
+            merge=True,
+            timeout=_firestore_timeout_sec(),
+        )
+        _set_backfill_status(
+            uid, "completed", progress=1.0, message="Mi Fitness completato", source="mi_fitness"
+        )
+        _set_last_successful_sync(uid)
+        logger.success(f"Backfill Mi Fitness completato {uid[:8]}…")
+    except Exception as e:
+        logger.exception("mi_fitness backfill")
+        _set_backfill_status(uid, "error", message=str(e)[:500], source="mi_fitness")
+
+
 @app.post("/garmin/sync-today")
 async def garmin_sync_today(
     req: GarminSyncRequest,
@@ -1878,7 +2030,7 @@ async def sync_delta(
     _require_db()
     uid = req.uid.strip()
     last = _parse_last_successful_sync(req.lastSuccessfulSync)
-    sources = {s.lower() for s in (req.sources or ["garmin", "strava"])}
+    sources = {s.lower() for s in (req.sources or ["garmin", "strava", "mi_fitness"])}
     try:
         delta_writes = 0
         if "garmin" in sources:
@@ -1891,6 +2043,11 @@ async def sync_delta(
                 delta_writes += _delta_strava(uid, last)
             except Exception as e:
                 logger.warning(f"delta strava: {e}")
+        if "mi_fitness" in sources:
+            try:
+                delta_writes += _delta_mi_fitness(uid, last)
+            except Exception as e:
+                logger.warning(f"delta mi_fitness: {e}")
         _set_last_successful_sync(uid)
         return {
             "success": True,
@@ -1949,6 +2106,67 @@ async def strava_disconnect(
         timeout=_firestore_timeout_sec(),
     )
     return {"success": True, "message": "Strava disconnesso sul server"}
+
+
+@app.post("/mi-fitness/connect")
+async def mi_fitness_connect(
+    req: MiFitnessConnectRequest,
+    _: None = Depends(verify_optional_bearer),
+):
+    _require_db()
+    uid = req.uid.strip()
+    try:
+        login_json = mi_fitness_sync.login_with_email_password(req.email.strip(), req.password)
+        session = mi_fitness_sync.session_from_login_result(login_json)
+    except mi_fitness_sync.MiFitnessAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e)[:500])
+    _save_mi_fitness_session_to_firestore(uid, session)
+    db.collection("users").document(uid).set(
+        {
+            "mi_fitness_linked": True,
+            "mi_fitness_linked_at": datetime.utcnow().isoformat(),
+            "mi_fitness_initial_sync_done": False,
+        },
+        merge=True,
+        timeout=_firestore_timeout_sec(),
+    )
+    _set_backfill_status(
+        uid,
+        "pending",
+        progress=0.0,
+        message="Mi Fitness in coda",
+        source="mi_fitness",
+    )
+    threading.Thread(
+        target=_mi_fitness_backfill_worker,
+        args=(uid,),
+        daemon=True,
+        name=f"mi_fit_backfill_{uid[:8]}",
+    ).start()
+    return {
+        "success": True,
+        "message": "Mi Fitness collegato sul server (sincronizzazione in corso)",
+        "backfillQueued": True,
+    }
+
+
+@app.post("/mi-fitness/disconnect")
+async def mi_fitness_disconnect(
+    req: MiFitnessDisconnectRequest,
+    _: None = Depends(verify_optional_bearer),
+):
+    _require_db()
+    uid = req.uid.strip()
+    _delete_mi_fitness_session_from_firestore(uid)
+    db.collection("users").document(uid).set(
+        {
+            "mi_fitness_linked": False,
+            "mi_fitness_initial_sync_done": False,
+        },
+        merge=True,
+        timeout=_firestore_timeout_sec(),
+    )
+    return {"success": True, "message": "Mi Fitness disconnesso sul server"}
 
 
 @app.post("/garmin/activity-detail")
@@ -2284,8 +2502,10 @@ def _activity_compare_payload(d: dict | None) -> dict:
         "source",
         "hasGarmin",
         "hasStrava",
+        "hasMiFitness",
         "garminActivityId",
         "stravaActivityId",
+        "miFitnessTrackId",
         "avgHeartrate",
         "maxHeartrate",
         "elevationGainM",
@@ -2297,7 +2517,7 @@ def _activity_compare_payload(d: dict | None) -> dict:
     for k in keys:
         if k in d:
             out[k] = _norm_cmp_val(d.get(k))
-    for rawk in ("garmin_raw", "strava_raw"):
+    for rawk in ("garmin_raw", "strava_raw", "mi_fitness_raw"):
         if rawk in d and d[rawk] is not None:
             out[rawk] = _norm_cmp_val(d[rawk])
     return out
@@ -2360,6 +2580,29 @@ def _existing_has_garmin(data: dict | None) -> bool:
     )
 
 
+def _existing_has_mi_fitness(data: dict | None) -> bool:
+    if not data:
+        return False
+    return bool(
+        data.get("hasMiFitness")
+        or data.get("miFitnessTrackId")
+        or data.get("mi_fitness_raw")
+    )
+
+
+def _activity_source_triple(has_garmin: bool, has_strava: bool, has_mi_fitness: bool) -> str:
+    c = sum(1 for x in (has_garmin, has_strava, has_mi_fitness) if x)
+    if c >= 2:
+        return "dual"
+    if has_garmin:
+        return "garmin"
+    if has_strava:
+        return "strava"
+    if has_mi_fitness:
+        return "mi_fitness"
+    return "unknown"
+
+
 def _parse_strava_start(raw: dict) -> datetime:
     v = raw.get("start_date") or raw.get("start_date_local")
     if not v:
@@ -2381,11 +2624,15 @@ def _build_unified_strava_doc(
     if avg_speed is not None:
         avg_speed = float(avg_speed)
     has_g = _existing_has_garmin(existing)
+    has_m = _existing_has_mi_fitness(existing)
     garmin_raw = existing.get("garmin_raw") if existing else None
+    mi_tid = existing.get("miFitnessTrackId") if existing else None
+    mi_fb = existing.get("mi_fitness_raw") if existing else None
     raw_safe = _firestore_safe_raw(raw, max_depth=6) or {}
+    mi_raw_safe = _firestore_safe_raw(mi_fb, max_depth=6) if mi_fb else None
     return {
         "id": doc_id,
-        "source": "dual" if has_g else "strava",
+        "source": _activity_source_triple(has_g, True, has_m),
         "date": start_dt,
         "startTime": start_dt,
         "dateKey": _date_key(start_dt),
@@ -2408,10 +2655,13 @@ def _build_unified_strava_doc(
         "elapsedMinutes": elapsed_sec / 60.0,
         "hasGarmin": has_g,
         "hasStrava": True,
+        "hasMiFitness": has_m,
         "garminActivityId": existing.get("garminActivityId") if existing else None,
         "stravaActivityId": str(raw.get("id") or ""),
+        "miFitnessTrackId": str(mi_tid) if mi_tid is not None else None,
         "garmin_raw": _firestore_safe_raw(garmin_raw) if garmin_raw else None,
         "strava_raw": raw_safe,
+        "mi_fitness_raw": mi_raw_safe,
         "raw": raw_safe,
         "syncedAt": datetime.utcnow(),
     }
@@ -2426,6 +2676,112 @@ def _upsert_strava_activity(uid: str, raw: dict) -> bool:
     sid = raw.get("id")
     doc_id = existing["id"] if existing else f"strava_{sid}"
     merged = _build_unified_strava_doc(doc_id, raw, start_dt, existing)
+    changed = _write_activity_if_changed(uid, doc_id, merged)
+    if changed:
+        _refresh_daily_log_index(uid, dk)
+    return changed
+
+
+def _parse_mi_fitness_track_start(summary_row: dict[str, Any]) -> datetime | None:
+    tid = summary_row.get("trackid")
+    if tid is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(str(tid)), tz=timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _build_unified_mi_fitness_doc(
+    doc_id: str,
+    norm: dict[str, Any],
+    start_dt: datetime,
+    *,
+    mi_summary_safe: dict,
+    existing: dict | None = None,
+) -> dict:
+    distance_m = float(norm.get("distance") or 0)
+    moving_sec = int(norm.get("moving_time") or 0)
+    elapsed_sec = int(norm.get("elapsed_time") or moving_sec)
+
+    def _sf(v: Any) -> float | None:
+        if v is None or v == "":
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            return float(str(v).strip().replace(",", "."))
+        except (TypeError, ValueError):
+            return None
+
+    avg_hrf = _sf(norm.get("average_heartrate"))
+    max_hrf = _sf(norm.get("max_heartrate"))
+    cal_f = _sf(norm.get("calories"))
+
+    has_g = _existing_has_garmin(existing)
+    has_s = _existing_has_strava(existing)
+    gr = existing.get("garmin_raw") if existing else None
+    sr = existing.get("strava_raw") if existing else None
+    garmin_tid = existing.get("garminActivityId") if existing else None
+    strava_tid = existing.get("stravaActivityId") if existing else None
+
+    raw_out: Any = mi_summary_safe
+    if has_s and sr:
+        raw_out = _firestore_safe_raw(sr, max_depth=6)
+    elif has_g and gr and not has_s:
+        raw_out = _firestore_safe_raw(gr, max_depth=6)
+
+    alt = mi_summary_safe.get("altitude_ascend")
+    elev_m = _sf(alt)
+
+    dev = norm.get("device_name") or mi_summary_safe.get("bind_device") or "Mi Fitness"
+
+    return {
+        "id": doc_id,
+        "source": _activity_source_triple(has_g, has_s, True),
+        "date": start_dt,
+        "startTime": start_dt,
+        "dateKey": _date_key(start_dt),
+        "calories": cal_f,
+        "distanceKm": (distance_m / 1000.0) if distance_m > 0 else None,
+        "activeMinutes": moving_sec / 60.0 if moving_sec else None,
+        "activityType": norm.get("sport_type"),
+        "activityName": norm.get("name"),
+        "deviceName": str(dev)[:120] if dev else "Mi Fitness",
+        "elevationGainM": elev_m,
+        "avgHeartrate": avg_hrf,
+        "maxHeartrate": max_hrf,
+        "avgSpeedKmh": None,
+        "elapsedMinutes": elapsed_sec / 60.0 if elapsed_sec else None,
+        "hasGarmin": has_g,
+        "hasStrava": has_s,
+        "hasMiFitness": True,
+        "garminActivityId": garmin_tid,
+        "stravaActivityId": str(strava_tid) if strava_tid is not None else None,
+        "miFitnessTrackId": str(norm.get("trackid") or ""),
+        "garmin_raw": _firestore_safe_raw(gr) if gr else None,
+        "strava_raw": _firestore_safe_raw(sr) if sr else None,
+        "mi_fitness_raw": mi_summary_safe,
+        "raw": raw_out,
+        "syncedAt": datetime.utcnow(),
+    }
+
+
+def _upsert_mi_fitness_activity(uid: str, summary_row: dict[str, Any]) -> bool:
+    norm = mi_fitness_sync.summary_to_normalized_activity(summary_row)
+    start_dt = _parse_mi_fitness_track_start(summary_row) or datetime.utcnow()
+    dk = _date_key(start_dt)
+    incoming_type = str(norm.get("sport_type") or "")
+    existing_docs = _load_existing_activities_for_date(uid, dk)
+    existing = _find_matching_activity(existing_docs, start_dt, incoming_type)
+    tid = norm.get("trackid")
+    if not tid:
+        return False
+    doc_id = existing["id"] if existing else f"mi_fitness_{tid}"
+    mi_safe = _firestore_safe_raw(summary_row, max_depth=8) or {}
+    merged = _build_unified_mi_fitness_doc(
+        doc_id, norm, start_dt, mi_summary_safe=mi_safe, existing=existing
+    )
     changed = _write_activity_if_changed(uid, doc_id, merged)
     if changed:
         _refresh_daily_log_index(uid, dk)
@@ -2492,7 +2848,10 @@ def _build_unified_garmin_doc(
     distance_val = float(distance_raw) if isinstance(distance_raw, (int, float)) else 0.0
     distance_km = distance_val / 1000 if distance_val > 100 else distance_val
     has_strava = _existing_has_strava(existing)
+    has_mi = _existing_has_mi_fitness(existing)
     strava_raw = existing.get("strava_raw") if existing else None
+    mi_raw_ex = existing.get("mi_fitness_raw") if existing else None
+    mi_tid = existing.get("miFitnessTrackId") if existing else None
 
     if list_mode:
         garmin_raw_out = _garmin_list_summary_raw(act)
@@ -2500,14 +2859,15 @@ def _build_unified_garmin_doc(
         garmin_raw_out = _firestore_safe_enrichment(act)
         if garmin_raw_out is None:
             garmin_raw_out = _firestore_safe_raw(act, max_depth=6)
-    if has_strava:
-        raw_out = _firestore_safe_raw(strava_raw) if strava_raw else None
-    else:
-        raw_out = garmin_raw_out
+    raw_out = garmin_raw_out
+    if has_strava and strava_raw:
+        raw_out = _firestore_safe_raw(strava_raw) if strava_raw else garmin_raw_out
+    elif has_mi and mi_raw_ex and not has_strava:
+        raw_out = _firestore_safe_raw(mi_raw_ex, max_depth=6) if mi_raw_ex else garmin_raw_out
 
     return {
         "id": doc_id,
-        "source": "dual" if has_strava else "garmin",
+        "source": _activity_source_triple(True, has_strava, has_mi),
         "date": start_dt,
         "startTime": start_dt,
         "dateKey": _date_key(start_dt),
@@ -2523,10 +2883,13 @@ def _build_unified_garmin_doc(
         "elapsedMinutes": (duration_sec / 60.0) if duration_sec else None,
         "hasGarmin": True,
         "hasStrava": has_strava,
+        "hasMiFitness": has_mi,
         "garminActivityId": act_id or None,
         "stravaActivityId": str(existing.get("stravaActivityId")) if existing and existing.get("stravaActivityId") is not None else None,
+        "miFitnessTrackId": str(mi_tid) if mi_tid is not None else None,
         "garmin_raw": garmin_raw_out,
         "strava_raw": _firestore_safe_raw(strava_raw) if strava_raw else None,
+        "mi_fitness_raw": _firestore_safe_raw(mi_raw_ex, max_depth=6) if mi_raw_ex else None,
         "raw": raw_out,
         "syncedAt": datetime.utcnow(),
     }
@@ -2862,7 +3225,7 @@ def sync_user(uid: str, client: Garmin | None = None):
 
 # === SCHEDULER (multi-utente) ===
 def scheduled_sync():
-    """Sync Garmin per tutti gli utenti con garmin_linked=True."""
+    """Garmin (`garmin_linked`) più pull Mi Fitness; utenti solo Mi Fitness dopo il batch Garmin."""
     if db is None:
         return
     logger.info("Inizio sync batch (utenti garmin_linked)...")
@@ -2871,21 +3234,49 @@ def scheduled_sync():
         uq = uq.where(filter=FieldFilter("garmin_linked", "==", True))
     else:
         uq = uq.where("garmin_linked", "==", True)
-    users = list(uq.stream())
-    if not users:
-        logger.info("Nessun utente garmin_linked, sync batch saltata")
-        return
-    for user in users:
-        try:
-            result = sync_user(user.id)
-            if result.get("success"):
-                logger.info(f"  ✓ {user.id[:8]}... ok")
-            else:
-                logger.warning(f"  ✗ {user.id[:8]}... {result.get('message', '')}")
-        except Exception as e:
-            logger.error(f"  ✗ {user.id[:8]}... {e}")
-        time.sleep(10)  # rate-limit API Garmin
-    logger.info(f"Sync batch completato ({len(users)} utenti)")
+    users_g = list(uq.stream())
+    garmin_uid_set = {snap.id for snap in users_g}
+    if users_g:
+        for user in users_g:
+            try:
+                ud = user.to_dict() or {}
+                result = sync_user(user.id)
+                if ud.get("mi_fitness_linked") and result.get("success"):
+                    try:
+                        _delta_mi_fitness(
+                            user.id,
+                            datetime.now(timezone.utc) - timedelta(days=14),
+                        )
+                    except Exception as e:
+                        logger.warning(f"  batch Mi Fitness Garmin-user {user.id[:8]}… {e}")
+                if result.get("success"):
+                    logger.info(f"  ✓ {user.id[:8]}... ok")
+                else:
+                    logger.warning(f"  ✗ {user.id[:8]}... {result.get('message', '')}")
+            except Exception as e:
+                logger.error(f"  ✗ {user.id[:8]}... {e}")
+            time.sleep(10)
+        logger.info(f"Sync Garmin batch completato ({len(users_g)} utenti)")
+
+    uq_mi = db.collection("users")
+    if FieldFilter is not None:
+        uq_mi = uq_mi.where(filter=FieldFilter("mi_fitness_linked", "==", True))
+    else:
+        uq_mi = uq_mi.where("mi_fitness_linked", "==", True)
+    users_mi = list(uq_mi.stream())
+    only_mi = [u for u in users_mi if u.id not in garmin_uid_set]
+    if only_mi:
+        logger.info(f"Sync batch Mi Fitness solo ({len(only_mi)} utenti)...")
+        for user in only_mi:
+            try:
+                w = _delta_mi_fitness(
+                    user.id,
+                    datetime.now(timezone.utc) - timedelta(days=14),
+                )
+                logger.info(f"  Mi Fitness ✓ {user.id[:8]}… scritte≈{w}")
+            except Exception as e:
+                logger.error(f"  Mi Fitness ✗ {user.id[:8]}… {e}")
+            time.sleep(3)
 
 
 # === ENDPOINT PER CRON ESTERNO (opzionale) ===
