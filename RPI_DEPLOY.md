@@ -104,6 +104,38 @@ GARMIN_SERVER_URL=http://172.20.10.4:8080
 
 Usa l’**IPv4** del Pi visibile dal telefono (il client HTTP dell’app di solito non usa IPv6 letterale). Fuori dalla LAN serve un tunnel/URL pubblico verso la porta 8080 (Tailscale, reverse proxy, ecc.).
 
+### Mi Fitness: Web PWA, `405`, `Failed to fetch` e stesso comportamento della app Windows
+
+- **Collegamento dall'app**: FitAI Analyzer usa sempre **POST** verso `/mi-fitness/connect` con body JSON (`uid`, `email`, `password`) sia su **Flutter Web / PWA** sia su **Windows desktop**; non c'è un secondo metodo OAuth dedicato alla web come per Garmin/Strava.
+- **`405 Method Not Allowed` aprendo solo l’URL nella barra del browser**: prima era normale (GET mentre l’endpoint accetta POST). Con le versioni recenti del server, **GET `/mi-fitness/connect`** risponde con un JSON esplicativo; l’abbinamento reale è solo **POST**.
+- **`ClientException: Failed to fetch`** (molto frequente **su Web**): apri **F12** → **Network**, rifai «Collega Mi Fitness»:
+
+  1. Richiesta **OPTIONS** (preflight) verso `.../mi-fitness/connect`: deve rispondere **200** con header `Access-Control-*` coerenti. Se OPTIONS fallisce (403/502/ vuoto), il browser blocca la POST e mostra *Failed to fetch*.
+  2. Poi verifica la **POST** (status e corpo).
+
+**Test POST dal PC** (vale per proxy + HTTPS; sostituisci l’host):
+
+```bash
+curl -sS -w "\nHTTP_CODE:%{http_code}\n" -X POST "https://ESEMPIO.DUCKDNS.ORG/mi-fitness/connect" \
+  -H "Content-Type: application/json" \
+  -d "{\"uid\":\"TEST\",\"email\":\"nobody@example.com\",\"password\":\"x\"}"
+```
+
+Se `curl` riceve una risposta (anche errore Firebase/Huami) ma la PWA no → problema quasi sempre **reverse proxy**, **HTTPS/CORS sul preflight** o **mixed content** (sito pubblico HTTPS che chiama `http://` il Pi viene bloccato).
+
+**Reverse proxy (nginx ecc.) davanti a uvicorn**: deve inoltrare **OPTIONS** e **POST** sulla stessa `location`. Esempio:
+
+```nginx
+proxy_pass http://127.0.0.1:8080;
+proxy_http_version 1.1;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+```
+
+Poi `sudo nginx -t && sudo systemctl reload nginx`. Catena TLS completa sul dominio pubblico (`*.duckdns.org`).
+
 **SSH da PC:** se `172.20.10.4` non risponde, prova IPv6:
 
 `ssh -6 cperciun@[2a02:b025:14:79c8:c244:4ff3:3191:33d2]`

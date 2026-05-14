@@ -68,7 +68,7 @@ import strava_sync
 import mi_fitness_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.16"
+SERVER_VERSION = "1.1.15"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -799,27 +799,6 @@ def _delete_mi_fitness_session_from_firestore(uid: str) -> None:
     )
 
 
-def _persist_mi_fitness_api_base_if_changed(
-    uid: str, sess: dict, used_base: str
-) -> None:
-    """Salva su Firestore l'host Huami che ha accettato il token (DE vs globale)."""
-    prev = str(sess.get("api_base") or "").rstrip("/")
-    u = (used_base or "").rstrip("/")
-    if not u or u == prev:
-        return
-    _save_mi_fitness_session_to_firestore(uid, {"api_base": u})
-
-
-def _mi_fitness_api_base_from_session(sess: dict) -> str:
-    raw = (sess.get("api_base") or "").strip()
-    if raw:
-        return raw.rstrip("/")
-    rn = str(sess.get("mi_fitness_region") or "").strip().lower()
-    if rn not in ("eu", "us"):
-        rn = mi_fitness_sync.normalize_mifitness_region(None)
-    return mi_fitness_sync.default_api_base_for_region(rn).rstrip("/")
-
-
 def _strava_client_configured() -> bool:
     cid = (os.getenv("STRAVA_CLIENT_ID") or "").strip()
     sec = (os.getenv("STRAVA_CLIENT_SECRET") or "").strip()
@@ -1038,7 +1017,6 @@ class MiFitnessConnectRequest(BaseModel):
     uid: str
     email: str
     password: str
-    region: str | None = None
 
 
 class MiFitnessDisconnectRequest(BaseModel):
@@ -1868,19 +1846,16 @@ def _delta_mi_fitness(uid: str, last: datetime | None) -> int:
     token = str(sess.get("app_token") or "").strip()
     if not token:
         return 0
-    base = _mi_fitness_api_base_from_session(sess)
+    base = (sess.get("api_base") or mi_fitness_sync.DEFAULT_API_BASE).rstrip("/")
     since = last or (datetime.now(timezone.utc) - timedelta(days=7))
     since_ts = int(since.timestamp())
     try:
-        result = mi_fitness_sync.fetch_workout_summaries_paginated(
+        rows = mi_fitness_sync.fetch_workout_summaries_paginated(
             token,
             api_base=base,
             since_ts=since_ts,
             max_summaries=min(3500, int(os.getenv("MI_FITNESS_DELTA_MAX_ROWS", "800"))),
         )
-        rows = result.rows
-        if result.api_base_used.rstrip("/") != base:
-            _persist_mi_fitness_api_base_if_changed(uid, sess, result.api_base_used)
     except mi_fitness_sync.MiFitnessApiError as e:
         logger.warning(f"delta mi_fitness API {uid[:8]}…: {e}")
         return 0
@@ -1969,19 +1944,16 @@ def _mi_fitness_backfill_worker(uid: str) -> None:
         if not token:
             _set_backfill_status(uid, "error", message="app_token mancante", source="mi_fitness")
             return
-        base = _mi_fitness_api_base_from_session(sess)
+        base = (sess.get("api_base") or mi_fitness_sync.DEFAULT_API_BASE).rstrip("/")
         days = int(os.getenv("BACKFILL_DAYS", "60"))
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         since_ts = int(cutoff.timestamp())
-        result = mi_fitness_sync.fetch_workout_summaries_paginated(
+        rows = mi_fitness_sync.fetch_workout_summaries_paginated(
             token,
             api_base=base,
             since_ts=None,
             max_summaries=min(8000, int(os.getenv("MI_FITNESS_BACKFILL_MAX_ROWS", "5000"))),
         )
-        rows = result.rows
-        if result.api_base_used.rstrip("/") != base:
-            _persist_mi_fitness_api_base_if_changed(uid, sess, result.api_base_used)
         n = 0
         for row in rows:
             if not isinstance(row, dict):
@@ -2136,6 +2108,38 @@ async def strava_disconnect(
     return {"success": True, "message": "Strava disconnesso sul server"}
 
 
+@app.get("/mi-fitness/connect")
+def mi_fitness_connect_hint():
+    """
+    Aprire l'URL nel browser esegue GET: l'abbinamento dell'account avviene solo con POST JSON.
+    Risposta esplicita per evitare confusione con FastAPI ``405 Method Not Allowed``.
+    """
+    return {
+        "detail": (
+            "Usa POST con Content-Type application/json sullo stesso path. "
+            "Corpo richiesto: {\"uid\":\"<Firebase uid>\",\"email\":\"...\",\"password\":\"...\"}."
+        ),
+        "method_allowed": ["POST"],
+        "note_web": (
+            "Flutter Web usa il fetch del browser: in caso di "
+            "`ClientException: Failed to fetch` controllare CORS/OPTIONS sul reverse proxy "
+            "(vedi RPI_DEPLOY.md, sezione Mi Fitness)."
+        ),
+    }
+
+
+@app.get("/mi-fitness/disconnect")
+def mi_fitness_disconnect_hint():
+    """Stesso ruolo diagnostico di GET /mi-fitness/connect per la disconnessione."""
+    return {
+        "detail": (
+            "Usa POST con JSON {\"uid\":\"<Firebase uid>\"} sullo stesso path "
+            "per disconnettere Mi Fitness sul server."
+        ),
+        "method_allowed": ["POST"],
+    }
+
+
 @app.post("/mi-fitness/connect")
 async def mi_fitness_connect(
     req: MiFitnessConnectRequest,
@@ -2144,13 +2148,8 @@ async def mi_fitness_connect(
     _require_db()
     uid = req.uid.strip()
     try:
-        rn = mi_fitness_sync.normalize_mifitness_region(req.region)
-        login_json = mi_fitness_sync.login_with_email_password(
-            req.email.strip(), req.password, region=req.region
-        )
-        session = mi_fitness_sync.session_from_login_result(
-            login_json, region_norm=rn
-        )
+        login_json = mi_fitness_sync.login_with_email_password(req.email.strip(), req.password)
+        session = mi_fitness_sync.session_from_login_result(login_json)
     except mi_fitness_sync.MiFitnessAuthError as e:
         raise HTTPException(status_code=401, detail=str(e)[:500])
     _save_mi_fitness_session_to_firestore(uid, session)
