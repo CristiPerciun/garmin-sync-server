@@ -37,14 +37,15 @@ _ZEPP_AES_IV = b"MAAAYAAAAAAAAABg"
 
 ZEPP_US2_TOKENS_URL = "https://api-user-us2.zepp.com/v2/registrations/tokens"
 ZEPP_US2_LOGIN_URL = "https://api-mifit-us2.zepp.com/v2/client/login"
-ZEPP_EU2_TOKENS_URL = "https://api-user-eu2.zepp.com/v2/registrations/tokens"
-ZEPP_EU2_LOGIN_URL = "https://api-mifit-eu2.zepp.com/v2/client/login"
+# Zepp UE: i vecchi *.eu2.zepp.com sono NXDOMAIN; i CNAME attuali sono *.de2 (stesso alb eu-central).
+ZEPP_EU_TOKENS_URL = "https://api-user-de2.zepp.com/v2/registrations/tokens"
+ZEPP_EU_LOGIN_URL = "https://api-mifit-de2.zepp.com/v2/client/login"
 
 _REDIRECT_STATUS = frozenset({301, 302, 303, 307, 308})
 
 
 def normalize_mifitness_region(region: str | None) -> str:
-    """eu = prima EU (Huami DE + Zepp EU2); us = globale + Zepp US2."""
+    """eu = prima EU (Huami DE + Zepp EU/de2); us = globale + Zepp US2."""
     env = (os.getenv("MI_FITNESS_REGION") or "").strip().lower()
     default = env if env in ("eu", "us") else "eu"
     r = (region or "").strip().lower()
@@ -300,13 +301,13 @@ def _login_zepp_encrypted(
     order: list[tuple[str, str, str, str, str]] = []
     if prefer == "eu":
         order = [
-            (ZEPP_EU2_TOKENS_URL, ZEPP_EU2_LOGIN_URL, "eu-central-1", "DE"),
+            (ZEPP_EU_TOKENS_URL, ZEPP_EU_LOGIN_URL, "eu-central-1", "DE"),
             (ZEPP_US2_TOKENS_URL, ZEPP_US2_LOGIN_URL, "us-west-2", "US"),
         ]
     else:
         order = [
             (ZEPP_US2_TOKENS_URL, ZEPP_US2_LOGIN_URL, "us-west-2", "US"),
-            (ZEPP_EU2_TOKENS_URL, ZEPP_EU2_LOGIN_URL, "eu-central-1", "DE"),
+            (ZEPP_EU_TOKENS_URL, ZEPP_EU_LOGIN_URL, "eu-central-1", "DE"),
         ]
     errs: list[str] = []
     for tokens_url, login_url, zreg, c_hint in order:
@@ -397,7 +398,7 @@ def login_with_email_password(
     Esegue login Huami e restituisce il JSON di risposta login (token_info.*).
 
     Prova prima il flusso legacy in chiaro; se manca `access` nel redirect
-    (tipico con account Zepp/beta), usa POST cifrato verso cluster Zepp EU2 o US2.
+    (tipico con account Zepp/beta), usa POST cifrato verso cluster Zepp EU (de2) o US2.
     `region` vedi ``normalize_mifitness_region`` (default server: EU).
     """
     em = (email or "").strip()
