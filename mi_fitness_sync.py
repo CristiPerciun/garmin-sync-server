@@ -397,8 +397,9 @@ def login_with_email_password(
     """
     Esegue login Huami e restituisce il JSON di risposta login (token_info.*).
 
-    Prova prima il flusso legacy in chiaro; se manca `access` nel redirect
-    (tipico con account Zepp/beta), usa POST cifrato verso cluster Zepp EU (de2) o US2.
+    Prova prima il flusso legacy in chiaro verso api-user.huami.com; poi, se quel
+    flusso fallisce totalmente oppure nella redirect manca ``access``, tenta POST
+    cifrato Zepp EU (de2) e US2. Molti account recenti Zepp richiedono lo step Zepp.
     `region` vedi ``normalize_mifitness_region`` (default server: EU).
     """
     em = (email or "").strip()
@@ -407,17 +408,23 @@ def login_with_email_password(
     rn = normalize_mifitness_region(region)
 
     with httpx.Client(timeout=timeout) as client:
-        legacy_json, legacy_diag = _legacy_login_attempt(client, em, password)
-        if legacy_json is not None:
-            return legacy_json
+        legacy_diag: str | None = None
+        try:
+            legacy_json, legacy_diag = _legacy_login_attempt(client, em, password)
+            if legacy_json is not None:
+                return legacy_json
+        except MiFitnessAuthError as e:
+            # Prima il legacy mandava errore diretto HTTP (nessun redirect): non bloccare
+            # il fallback Zepp cifrato, che è quello tipico degli account Zepp solo-app.
+            legacy_diag = str(e)
 
         try:
             return _login_zepp_encrypted(client, em, password, prefer_region=rn)
         except MiFitnessAuthError as e:
-            hint = legacy_diag or ""
+            hint = (legacy_diag or "").strip()
             if hint and str(e) not in hint:
                 raise MiFitnessAuthError(
-                    f"{hint} — Fallback Zepp: {e}"
+                    f"{hint[:350]} — Fallback Zepp: {e}"
                 ) from e
             raise
 
