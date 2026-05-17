@@ -86,6 +86,10 @@ class MiFitnessAuthError(Exception):
     """Credenziali errate o risposta inattesa da Huami."""
 
 
+class MiFitnessTransportError(Exception):
+    """DNS/timeout/connessione verso Xiaomi/Huami/Zepp (non credenziali)."""
+
+
 class MiFitnessApiError(Exception):
     """Errore HTTP/API dopo login."""
 
@@ -306,6 +310,7 @@ def _login_zepp_encrypted(
         ]
     errs: list[str] = []
     for tokens_url, login_url, zreg, c_hint in order:
+        host = urllib.parse.urlparse(tokens_url).hostname or ""
         try:
             return _login_zepp_encrypted_one(
                 client,
@@ -317,8 +322,15 @@ def _login_zepp_encrypted(
                 country_code_hint=c_hint,
             )
         except MiFitnessAuthError as e:
-            errs.append(str(e)[:220])
-    raise MiFitnessAuthError("Zepp login: falliti tutti i cluster. " + " | ".join(errs))
+            errs.append(f"[{host}] {str(e)[:200]}")
+        except httpx.RequestError as e:
+            errs.append(f"[{host}] rete: {e!s}")
+    joined = " | ".join(errs)
+    transport_only = bool(errs) and all(" rete:" in msg for msg in errs)
+    detail = "Zepp login: falliti tutti i cluster. " + joined
+    if transport_only:
+        raise MiFitnessTransportError(detail[:800]) from None
+    raise MiFitnessAuthError(detail[:800])
 
 
 def _legacy_login_attempt(

@@ -68,7 +68,7 @@ import strava_sync
 import mi_fitness_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.16"
+SERVER_VERSION = "1.1.17"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -2158,6 +2158,15 @@ async def mi_fitness_connect(
         )
     except mi_fitness_sync.MiFitnessAuthError as e:
         raise HTTPException(status_code=401, detail=str(e)[:500])
+    except mi_fitness_sync.MiFitnessTransportError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Rete/Zepp non raggiungibile dal server "
+                "(DNS, firewall o problema temporaneo). "
+                f"{str(e)[:380]}"
+            ),
+        ) from e
     except Exception as e:
         logger.exception("mi-fitness/connect: errore verso Huami/Zepp o libreria HTTP")
         raise HTTPException(
