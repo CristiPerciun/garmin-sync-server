@@ -1017,6 +1017,7 @@ class MiFitnessConnectRequest(BaseModel):
     uid: str
     email: str
     password: str
+    region: str | None = None
 
 
 class MiFitnessDisconnectRequest(BaseModel):
@@ -2147,9 +2148,14 @@ async def mi_fitness_connect(
 ):
     _require_db()
     uid = req.uid.strip()
+    rn = mi_fitness_sync.normalize_mifitness_region(req.region)
     try:
-        login_json = mi_fitness_sync.login_with_email_password(req.email.strip(), req.password)
-        session = mi_fitness_sync.session_from_login_result(login_json)
+        login_json = mi_fitness_sync.login_with_email_password(
+            req.email.strip(), req.password, region=rn
+        )
+        session = mi_fitness_sync.session_from_login_result(
+            login_json, region_norm=rn
+        )
     except mi_fitness_sync.MiFitnessAuthError as e:
         raise HTTPException(status_code=401, detail=str(e)[:500])
     _save_mi_fitness_session_to_firestore(uid, session)
