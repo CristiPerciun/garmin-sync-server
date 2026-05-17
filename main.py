@@ -68,7 +68,7 @@ import strava_sync
 import mi_fitness_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.15"
+SERVER_VERSION = "1.1.16"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -2158,23 +2158,40 @@ async def mi_fitness_connect(
         )
     except mi_fitness_sync.MiFitnessAuthError as e:
         raise HTTPException(status_code=401, detail=str(e)[:500])
-    _save_mi_fitness_session_to_firestore(uid, session)
-    db.collection("users").document(uid).set(
-        {
-            "mi_fitness_linked": True,
-            "mi_fitness_linked_at": datetime.utcnow().isoformat(),
-            "mi_fitness_initial_sync_done": False,
-        },
-        merge=True,
-        timeout=_firestore_timeout_sec(),
-    )
-    _set_backfill_status(
-        uid,
-        "pending",
-        progress=0.0,
-        message="Mi Fitness in coda",
-        source="mi_fitness",
-    )
+    except Exception as e:
+        logger.exception("mi-fitness/connect: errore verso Huami/Zepp o libreria HTTP")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Collegamento Mi Fitness fallito prima del salvataggio token "
+                "(rete verso Xiaomi/Huami, TLS o errore temporaneo). "
+                f"Dettaglio: {str(e)[:420]}"
+            ),
+        ) from e
+    try:
+        _save_mi_fitness_session_to_firestore(uid, session)
+        db.collection("users").document(uid).set(
+            {
+                "mi_fitness_linked": True,
+                "mi_fitness_linked_at": datetime.utcnow().isoformat(),
+                "mi_fitness_initial_sync_done": False,
+            },
+            merge=True,
+            timeout=_firestore_timeout_sec(),
+        )
+        _set_backfill_status(
+            uid,
+            "pending",
+            progress=0.0,
+            message="Mi Fitness in coda",
+            source="mi_fitness",
+        )
+    except Exception as e:
+        logger.exception("mi-fitness/connect: salvataggio token su Firestore")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Login Huami/Zepp ok ma salvataggio su Firebase fallito: {str(e)[:400]}",
+        ) from e
     threading.Thread(
         target=_mi_fitness_backfill_worker,
         args=(uid,),
