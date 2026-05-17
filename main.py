@@ -68,7 +68,7 @@ import strava_sync
 import mi_fitness_sync
 
 # Incrementa manualmente a ogni push che vuoi tracciare sul Pi (GET / → campo `version`).
-SERVER_VERSION = "1.1.19"
+SERVER_VERSION = "1.1.20"
 
 # Firestore client; valorizzato in lifespan (evita crash all'import se manca .env → systemd può avviare uvicorn)
 db = None
@@ -2157,6 +2157,13 @@ async def mi_fitness_connect(
             login_json, region_norm=rn
         )
     except mi_fitness_sync.MiFitnessAuthError as e:
+        msg = str(e)[:650]
+        logger.warning(
+            "mi-fitness/connect: Huami/Zepp rifiuta login uid={} region_norm={}: {}",
+            (uid[:10] + "…") if len(uid) > 10 else uid,
+            rn,
+            msg,
+        )
         raise HTTPException(status_code=401, detail=str(e)[:500])
     except mi_fitness_sync.MiFitnessTransportError as e:
         raise HTTPException(
