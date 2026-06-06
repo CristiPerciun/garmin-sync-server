@@ -1,6 +1,4 @@
-# .env non è più ignorato: così puoi versionarlo per allineare PC ↔ Pi (solo se il repo è
-# privato e accetti il rischio: secrets in git e nella history). Per repo pubblico usare
-# deploy manuale / secret manager e NON committare .env.
+.env
 firebase-service-account.json
 
 # Token Garmin (contengono dati sensibili) - la cartella resta, non i file
