@@ -42,6 +42,35 @@ def strava_refresh_access_token(
     return r.json()
 
 
+def strava_exchange_code(
+    client_id: str,
+    client_secret: str,
+    code: str,
+) -> dict[str, Any]:
+    """Scambia un authorization code OAuth con i token (grant_type=authorization_code).
+
+    Usa le credenziali dell'UNICA app Strava del server (modello single-app /
+    multi-utente): il client_secret resta solo qui, mai sul client. Strava non
+    richiede redirect_uri in questo step, quindi non viene inviato.
+    """
+    _strava_upstream_trace(
+        "POST https://www.strava.com/oauth/token (grant_type=authorization_code)"
+    )
+    r = httpx.post(
+        "https://www.strava.com/oauth/token",
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "grant_type": "authorization_code",
+        },
+        timeout=60.0,
+    )
+    _strava_upstream_trace(f"oauth/token (code) <- HTTP {r.status_code}")
+    r.raise_for_status()
+    return r.json()
+
+
 def strava_list_activities(
     access_token: str,
     *,

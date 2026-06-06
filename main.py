@@ -15,7 +15,7 @@ from garmin_env import env_flag_true, unset_garth_home_if_incomplete
 unset_garth_home_if_incomplete()
 
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import auth as firebase_auth, credentials, firestore
 
 try:
     from google.cloud.firestore_v1.base_query import FieldFilter
@@ -315,10 +315,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Garmin Sync - FitAI Analyzer", lifespan=lifespan)
 
-# CORS: permette richieste da FitAI Analyzer (web/mobile)
+# CORS: permette richieste da FitAI Analyzer (web/mobile).
+# Allowlist da FITAI_WEB_APP_ORIGIN_ALLOWLIST (CSV di origin); fallback "*" se non
+# impostata (retro-compatibile). In produzione impostare gli origin del web
+# (es. https://cristiperciun.github.io) per ridurre la superficie d'attacco.
+_cors_allowlist_raw = (os.getenv("FITAI_WEB_APP_ORIGIN_ALLOWLIST") or "").strip()
+_cors_origins = (
+    [o.strip() for o in _cors_allowlist_raw.split(",") if o.strip()]
+    if _cors_allowlist_raw
+    else ["*"]
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -852,6 +861,45 @@ def verify_optional_bearer(
         raise HTTPException(status_code=403, detail="Invalid bearer token")
 
 
+# Verifica per-utente: ID token Firebase nell'header X-Firebase-ID-Token.
+# Gated da ENFORCE_FIREBASE_AUTH: OFF -> best-effort (verifica il token se presente
+# ma non blocca, per un rollout non-breaking); ON -> token obbligatorio e l'uid del
+# token DEVE combaciare con quello del body (altrimenti 401/403).
+ENFORCE_FIREBASE_AUTH = env_flag_true("ENFORCE_FIREBASE_AUTH")
+
+
+def verify_firebase_uid(
+    x_firebase_id_token: Annotated[str | None, Header()] = None,
+) -> str | None:
+    """Ritorna l'uid del token Firebase verificato, o None se assente/non valido
+    (con enforcement OFF). Con enforcement ON: assenza/invalidita' -> 401."""
+    if not x_firebase_id_token:
+        if ENFORCE_FIREBASE_AUTH:
+            raise HTTPException(status_code=401, detail="Missing Firebase ID token")
+        return None
+    try:
+        decoded = firebase_auth.verify_id_token(x_firebase_id_token)
+        return decoded.get("uid")
+    except Exception as e:
+        if ENFORCE_FIREBASE_AUTH:
+            raise HTTPException(status_code=401, detail="Invalid Firebase ID token")
+        logger.warning(f"ID token Firebase non valido (enforce OFF): {e}")
+        return None
+
+
+def enforce_uid(body_uid: str, token_uid: str | None) -> str:
+    """Lega la richiesta all'utente autenticato. Con ENFORCE_FIREBASE_AUTH ON: il
+    token e' obbligatorio e il suo uid deve combaciare con quello del body (403 se
+    diverso). Ritorna l'uid da usare per le operazioni."""
+    if ENFORCE_FIREBASE_AUTH:
+        if not token_uid:
+            raise HTTPException(status_code=401, detail="Firebase ID token richiesto")
+        if body_uid and body_uid != token_uid:
+            raise HTTPException(status_code=403, detail="uid non corrisponde al token")
+        return token_uid
+    return body_uid
+
+
 class GarminConnect2StartRequest(BaseModel):
     uid: str
     email: str
@@ -1011,6 +1059,15 @@ class StravaRegisterRequest(BaseModel):
     access_token: str
     refresh_token: str
     expires_at: int | float | None = None
+
+
+class StravaExchangeRequest(BaseModel):
+    uid: str
+    code: str
+    redirect_uri: str | None = None
+    # NB: un eventuale `client_id` nel body viene ignorato (Pydantic lo scarta).
+    # Il server usa SEMPRE STRAVA_CLIENT_ID/STRAVA_CLIENT_SECRET del proprio .env
+    # (modello single-app multi-utente): il secret non transita mai dal client.
 
 
 class MiFitnessConnectRequest(BaseModel):
@@ -2063,9 +2120,10 @@ async def sync_delta(
 async def strava_register_tokens(
     req: StravaRegisterRequest,
     _: None = Depends(verify_optional_bearer),
+    token_uid: str | None = Depends(verify_firebase_uid),
 ):
     _require_db()
-    uid = req.uid.strip()
+    uid = enforce_uid(req.uid.strip(), token_uid)
     if not _strava_client_configured():
         raise HTTPException(
             status_code=503,
@@ -2093,13 +2151,74 @@ async def strava_register_tokens(
     }
 
 
+@app.post("/strava/exchange-oauth-code")
+async def strava_exchange_oauth_code(
+    req: StravaExchangeRequest,
+    _: None = Depends(verify_optional_bearer),
+    token_uid: str | None = Depends(verify_firebase_uid),
+):
+    """Scambio server-side del code OAuth -> token, con CLIENT_ID/SECRET del server.
+
+    Completa il flusso multi-utente: il client (web/mobile/desktop) ottiene solo il
+    `code` dall'autorizzazione dell'utente e lo invia qui; il secret resta sul server.
+    I token vengono salvati in strava_tokens/{uid}. Il backfill 60gg NON parte qui:
+    lo avvia /strava/register-tokens (chiamato subito dopo dal client) per non
+    duplicarlo. Se in futuro il client smettesse di chiamare register, spostare qui
+    l'avvio di _strava_backfill_worker.
+    """
+    _require_db()
+    uid = enforce_uid(req.uid.strip(), token_uid)
+    if not uid or not req.code.strip():
+        raise HTTPException(status_code=400, detail="uid e code sono obbligatori")
+    if not _strava_client_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Server senza STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET",
+        )
+    cid = os.getenv("STRAVA_CLIENT_ID", "").strip()
+    sec = os.getenv("STRAVA_CLIENT_SECRET", "").strip()
+    try:
+        data = strava_sync.strava_exchange_code(cid, sec, req.code.strip())
+    except Exception as e:
+        logger.warning(f"Strava exchange-oauth-code fallito {uid[:8]}…: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Scambio del code Strava rifiutato (code gia' usato/scaduto, "
+                "redirect_uri non registrato, o app non configurata)."
+            ),
+        )
+    access = data.get("access_token")
+    refresh = data.get("refresh_token")
+    if not access or not refresh:
+        raise HTTPException(status_code=502, detail="Risposta Strava senza token")
+    now = datetime.now(timezone.utc)
+    expires_at_epoch = data.get("expires_at")
+    expires_in = int(data.get("expires_in", 21600))
+    exp_dt = (
+        datetime.fromtimestamp(float(expires_at_epoch), tz=timezone.utc)
+        if expires_at_epoch is not None
+        else now + timedelta(seconds=expires_in)
+    )
+    _save_strava_tokens_to_firestore(uid, str(access), str(refresh), exp_dt)
+    return {
+        "success": True,
+        "message": "OAuth Strava completato",
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_in": expires_in,
+        "expires_at": int(exp_dt.timestamp()),
+    }
+
+
 @app.post("/strava/disconnect")
 async def strava_disconnect(
     req: GarminSyncRequest,
     _: None = Depends(verify_optional_bearer),
+    token_uid: str | None = Depends(verify_firebase_uid),
 ):
     _require_db()
-    uid = req.uid.strip()
+    uid = enforce_uid(req.uid.strip(), token_uid)
     _delete_strava_tokens_from_firestore(uid)
     db.collection("users").document(uid).set(
         {"strava_initial_sync_done": False},
@@ -2107,6 +2226,26 @@ async def strava_disconnect(
         timeout=_firestore_timeout_sec(),
     )
     return {"success": True, "message": "Strava disconnesso sul server"}
+
+
+@app.post("/strava/access-token")
+async def strava_access_token(
+    req: GarminSyncRequest,
+    _: None = Depends(verify_optional_bearer),
+    token_uid: str | None = Depends(verify_firebase_uid),
+):
+    """Ritorna un access token Strava valido per l'uid (refresh server-side se
+    necessario). Il CLIENT_SECRET non lascia mai il server. Usato dal client per le
+    letture dirette del dettaglio attivita'."""
+    _require_db()
+    uid = enforce_uid(req.uid.strip(), token_uid)
+    token = _ensure_strava_access_token(uid)
+    if not token:
+        raise HTTPException(
+            status_code=404,
+            detail="Strava non collegato o refresh non riuscito",
+        )
+    return {"success": True, "access_token": token}
 
 
 @app.get("/mi-fitness/connect")
