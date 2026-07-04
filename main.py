@@ -754,15 +754,25 @@ def _set_last_successful_sync(uid: str) -> None:
 
 
 def _save_strava_tokens_to_firestore(
-    uid: str, access: str, refresh: str, expires_at: datetime
+    uid: str,
+    access: str,
+    refresh: str,
+    expires_at: datetime,
+    client_id: str | None = None,
 ) -> None:
+    payload: dict[str, Any] = {
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_at": expires_at,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+    # Traccia il client_id (app Strava PER-UTENTE) accanto ai token: utile per
+    # diagnosi e per legare i token alle credenziali usate. Il secret NON viene
+    # mai salvato qui (vive solo in users/{uid}/app_sync/strava_oauth).
+    if client_id and str(client_id).strip():
+        payload["client_id"] = str(client_id).strip()
     db.collection(STRAVA_TOKENS_COLLECTION).document(uid).set(
-        {
-            "access_token": access,
-            "refresh_token": refresh,
-            "expires_at": expires_at,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-        },
+        payload,
         merge=True,
         timeout=_firestore_timeout_sec(),
     )
@@ -808,14 +818,51 @@ def _delete_mi_fitness_session_from_firestore(uid: str) -> None:
     )
 
 
-def _strava_client_configured() -> bool:
-    cid = (os.getenv("STRAVA_CLIENT_ID") or "").strip()
-    sec = (os.getenv("STRAVA_CLIENT_SECRET") or "").strip()
+def _get_strava_user_credentials(uid: str) -> tuple[str | None, str | None]:
+    """Credenziali app Strava **PER-UTENTE** (client_id, client_secret).
+
+    Ogni utente registra la propria app su https://www.strava.com/settings/api
+    (Strava consente una sola app collegata per account, quindi non esiste un'app
+    condivisa) e salva Client ID + Secret dal client in
+    ``users/{uid}/app_sync/strava_oauth``. Qui le leggiamo con l'Admin SDK: il
+    secret non transita mai dal client verso questo server e non sta nel bundle.
+
+    Fallback alle env ``STRAVA_CLIENT_ID``/``STRAVA_CLIENT_SECRET`` per singolo
+    campo mancante (utile solo per sviluppo/migrazione).
+    """
+    cid: str | None = None
+    sec: str | None = None
+    if db is not None and uid:
+        try:
+            doc = (
+                db.collection("users")
+                .document(uid)
+                .collection("app_sync")
+                .document("strava_oauth")
+                .get(timeout=_firestore_timeout_sec())
+            )
+            if doc.exists:
+                d = doc.to_dict() or {}
+                cid = (str(d.get("client_id") or "")).strip() or None
+                sec = (str(d.get("client_secret") or "")).strip() or None
+        except Exception as e:
+            logger.warning(f"lettura app_sync/strava_oauth {uid[:8]}…: {e}")
+    if not cid:
+        cid = (os.getenv("STRAVA_CLIENT_ID") or "").strip() or None
+    if not sec:
+        sec = (os.getenv("STRAVA_CLIENT_SECRET") or "").strip() or None
+    return cid, sec
+
+
+def _strava_credentials_available(uid: str) -> bool:
+    """Vero se l'utente ha credenziali Strava utilizzabili (per-utente o env)."""
+    cid, sec = _get_strava_user_credentials(uid)
     return bool(cid and sec)
 
 
 def _ensure_strava_access_token(uid: str) -> str | None:
-    if not _strava_client_configured():
+    cid, sec = _get_strava_user_credentials(uid)
+    if not (cid and sec):
         return None
     doc = _get_strava_tokens_from_firestore(uid)
     if not doc:
@@ -828,15 +875,13 @@ def _ensure_strava_access_token(uid: str) -> str | None:
     now = datetime.now(timezone.utc)
     if exp and now < exp - timedelta(minutes=5):
         return str(access)
-    cid = os.getenv("STRAVA_CLIENT_ID", "").strip()
-    sec = os.getenv("STRAVA_CLIENT_SECRET", "").strip()
     try:
         data = strava_sync.strava_refresh_access_token(cid, sec, str(refresh))
         new_a = data["access_token"]
         new_r = data.get("refresh_token", refresh)
         exp_in = int(data.get("expires_in", 3600))
         new_exp = now + timedelta(seconds=exp_in)
-        _save_strava_tokens_to_firestore(uid, new_a, str(new_r), new_exp)
+        _save_strava_tokens_to_firestore(uid, new_a, str(new_r), new_exp, client_id=cid)
         return new_a
     except Exception as e:
         logger.warning(f"Strava refresh fallito {uid[:8]}…: {e}")
@@ -1059,15 +1104,18 @@ class StravaRegisterRequest(BaseModel):
     access_token: str
     refresh_token: str
     expires_at: int | float | None = None
+    # client_id dell'app Strava PER-UTENTE (solo tracciamento accanto ai token).
+    client_id: str | None = None
 
 
 class StravaExchangeRequest(BaseModel):
     uid: str
     code: str
     redirect_uri: str | None = None
-    # NB: un eventuale `client_id` nel body viene ignorato (Pydantic lo scarta).
-    # Il server usa SEMPRE STRAVA_CLIENT_ID/STRAVA_CLIENT_SECRET del proprio .env
-    # (modello single-app multi-utente): il secret non transita mai dal client.
+    # client_id dell'app Strava PER-UTENTE. Fonte di verità del secret è comunque
+    # users/{uid}/app_sync/strava_oauth (letto server-side): il secret non
+    # transita mai dal client. Il client_id qui è informativo/di tracciamento.
+    client_id: str | None = None
 
 
 class MiFitnessConnectRequest(BaseModel):
@@ -1938,8 +1986,13 @@ def _delta_mi_fitness(uid: str, last: datetime | None) -> int:
 def _strava_backfill_worker(uid: str) -> None:
     if db is None:
         return
-    if not _strava_client_configured():
-        _set_backfill_status(uid, "error", message="STRAVA_CLIENT_ID/SECRET mancanti", source="strava")
+    if not _strava_credentials_available(uid):
+        _set_backfill_status(
+            uid,
+            "error",
+            message="Credenziali Strava mancanti (Client ID/Secret): reinseriscile nell'app",
+            source="strava",
+        )
         return
     try:
         _set_backfill_status(uid, "processing", progress=0.05, message="Strava backfill…", source="strava")
@@ -2096,7 +2149,7 @@ async def sync_delta(
                 delta_writes += _delta_garmin(uid, last)
             except Exception as e:
                 logger.warning(f"delta garmin: {e}")
-        if "strava" in sources and _strava_client_configured():
+        if "strava" in sources and _strava_credentials_available(uid):
             try:
                 delta_writes += _delta_strava(uid, last)
             except Exception as e:
@@ -2124,10 +2177,13 @@ async def strava_register_tokens(
 ):
     _require_db()
     uid = enforce_uid(req.uid.strip(), token_uid)
-    if not _strava_client_configured():
+    if not _strava_credentials_available(uid):
         raise HTTPException(
             status_code=503,
-            detail="Server senza STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET",
+            detail=(
+                "Credenziali Strava per-utente mancanti (Client ID/Secret): "
+                "salvale dall'app prima di collegare Strava."
+            ),
         )
     now = datetime.now(timezone.utc)
     exp = now + timedelta(hours=6)
@@ -2136,7 +2192,9 @@ async def strava_register_tokens(
         if x > 1e12:
             x /= 1000.0
         exp = datetime.fromtimestamp(x, tz=timezone.utc)
-    _save_strava_tokens_to_firestore(uid, req.access_token, req.refresh_token, exp)
+    _save_strava_tokens_to_firestore(
+        uid, req.access_token, req.refresh_token, exp, client_id=req.client_id
+    )
     _set_backfill_status(uid, "pending", progress=0.0, message="Strava in coda", source="strava")
     threading.Thread(
         target=_strava_backfill_worker,
@@ -2157,10 +2215,12 @@ async def strava_exchange_oauth_code(
     _: None = Depends(verify_optional_bearer),
     token_uid: str | None = Depends(verify_firebase_uid),
 ):
-    """Scambio server-side del code OAuth -> token, con CLIENT_ID/SECRET del server.
+    """Scambio server-side del code OAuth -> token, con le credenziali PER-UTENTE.
 
     Completa il flusso multi-utente: il client (web/mobile/desktop) ottiene solo il
-    `code` dall'autorizzazione dell'utente e lo invia qui; il secret resta sul server.
+    `code` dall'autorizzazione dell'utente e lo invia qui; il ``client_secret`` NON
+    viaggia col client ma viene letto server-side da ``users/{uid}/app_sync/strava_oauth``
+    (scritto dal client con l'SDK Firestore prima di avviare l'OAuth).
     I token vengono salvati in strava_tokens/{uid}. Il backfill 60gg NON parte qui:
     lo avvia /strava/register-tokens (chiamato subito dopo dal client) per non
     duplicarlo. Se in futuro il client smettesse di chiamare register, spostare qui
@@ -2170,13 +2230,15 @@ async def strava_exchange_oauth_code(
     uid = enforce_uid(req.uid.strip(), token_uid)
     if not uid or not req.code.strip():
         raise HTTPException(status_code=400, detail="uid e code sono obbligatori")
-    if not _strava_client_configured():
+    cid, sec = _get_strava_user_credentials(uid)
+    if not (cid and sec):
         raise HTTPException(
             status_code=503,
-            detail="Server senza STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET",
+            detail=(
+                "Credenziali Strava per-utente mancanti: salva Client ID e Client "
+                "Secret dell'app Strava nell'app prima di collegare."
+            ),
         )
-    cid = os.getenv("STRAVA_CLIENT_ID", "").strip()
-    sec = os.getenv("STRAVA_CLIENT_SECRET", "").strip()
     try:
         data = strava_sync.strava_exchange_code(cid, sec, req.code.strip())
     except Exception as e:
@@ -2185,7 +2247,7 @@ async def strava_exchange_oauth_code(
             status_code=400,
             detail=(
                 "Scambio del code Strava rifiutato (code gia' usato/scaduto, "
-                "redirect_uri non registrato, o app non configurata)."
+                "Client ID/Secret errati, o redirect_uri fuori dal Callback Domain)."
             ),
         )
     access = data.get("access_token")
@@ -2200,7 +2262,7 @@ async def strava_exchange_oauth_code(
         if expires_at_epoch is not None
         else now + timedelta(seconds=expires_in)
     )
-    _save_strava_tokens_to_firestore(uid, str(access), str(refresh), exp_dt)
+    _save_strava_tokens_to_firestore(uid, str(access), str(refresh), exp_dt, client_id=cid)
     return {
         "success": True,
         "message": "OAuth Strava completato",
