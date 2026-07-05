@@ -1,8 +1,9 @@
+import asyncio
 import json
 import os
 import re
 import secrets
-from urllib.parse import quote, urlencode, urlparse, urlunparse
+from urllib.parse import quote, urlencode, urlparse, urlunparse, urlsplit
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -320,8 +321,28 @@ app = FastAPI(title="Garmin Sync - FitAI Analyzer", lifespan=lifespan)
 # impostata (retro-compatibile). In produzione impostare gli origin del web
 # (es. https://cristiperciun.github.io) per ridurre la superficie d'attacco.
 _cors_allowlist_raw = (os.getenv("FITAI_WEB_APP_ORIGIN_ALLOWLIST") or "").strip()
+
+
+def _cors_origin_only(value: str) -> str:
+    """Riduce una voce dell'allowlist al solo origin ``scheme://host[:port]``.
+
+    Il browser invia l'header ``Origin`` SENZA path (es. ``https://host``),
+    quindi una voce con path/slash finale (es. ``https://host/App/``) non
+    combacerebbe mai e Starlette rifiuterebbe il preflight con 400
+    ("Disallowed CORS origin"). La stessa variabile è usata altrove per l'OAuth
+    con match di prefisso (dove il path serve): lì restiamo sul valore grezzo.
+    """
+    v = (value or "").strip()
+    if not v:
+        return v
+    parts = urlsplit(v)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return v.rstrip("/")
+
+
 _cors_origins = (
-    [o.strip() for o in _cors_allowlist_raw.split(",") if o.strip()]
+    sorted({_cors_origin_only(o) for o in _cors_allowlist_raw.split(",") if o.strip()})
     if _cors_allowlist_raw
     else ["*"]
 )
@@ -1791,7 +1812,7 @@ async def sync_vitals(
     logger.info(f"📥 sync-vitals richiesta ricevuta per uid={uid[:8]}...")
     try:
         logger.info(f"🔗 Connesso a Garmin Connect per {uid[:8]}..., avvio sync...")
-        return _run_garmin_sync_today(uid)
+        return await asyncio.to_thread(_run_garmin_sync_today, uid)
     except HTTPException:
         raise
     except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException, GarthHTTPError) as e:
@@ -1839,6 +1860,26 @@ def _parse_last_successful_sync(v) -> datetime | None:
     return None
 
 
+# Lock per-uid: serializza login Garmin + refresh/scrittura token per lo STESSO
+# utente tra le richieste HTTP (ora eseguite fuori dall'event loop via
+# asyncio.to_thread) e il thread dello scheduler. Senza, due login/refresh
+# concorrenti possono sovrascriversi il token in garmin_tokens/{uid} e
+# invalidare la sessione ("sync che random smette di funzionare"). Non-reentrant:
+# nessun percorso acquisisce due volte lo stesso lock (sync-today/delta/scheduler
+# sono rami disgiunti).
+_uid_garmin_locks: dict[str, threading.Lock] = {}
+_uid_garmin_locks_guard = threading.Lock()
+
+
+def _uid_garmin_lock(uid: str) -> threading.Lock:
+    with _uid_garmin_locks_guard:
+        lk = _uid_garmin_locks.get(uid)
+        if lk is None:
+            lk = threading.Lock()
+            _uid_garmin_locks[uid] = lk
+        return lk
+
+
 def _run_garmin_sync_today(uid: str) -> dict:
     """Logica condivisa sync-today / sync-vitals + lastSuccessfulSync."""
     token_b64 = _get_garmin_token_from_firestore(uid)
@@ -1847,23 +1888,24 @@ def _run_garmin_sync_today(uid: str) -> dict:
             status_code=404,
             detail="Account Garmin non collegato. Esegui prima il login Garmin.",
         )
-    client = Garmin()
-    client.login(tokenstore=token_b64)
-    sync_result = _sync_vitals_for_client(client, uid, num_days=2, activities_limit=50)
-    vitals_ok = sync_result.get("success", True) is not False
-    _store_sync_status(
-        uid,
-        success=vitals_ok,
-        message=sync_result.get("message"),
-        activities_synced=sync_result.get("activities_synced", 0),
-        health_days_synced=sync_result.get("health_days_synced", 0),
-    )
-    try:
-        _save_garmin_token_to_firestore(uid, client.garth.dumps())
-    except Exception:
-        pass
-    if vitals_ok:
-        _set_last_successful_sync(uid)
+    with _uid_garmin_lock(uid):
+        client = Garmin()
+        client.login(tokenstore=token_b64)
+        sync_result = _sync_vitals_for_client(client, uid, num_days=2, activities_limit=50)
+        vitals_ok = sync_result.get("success", True) is not False
+        _store_sync_status(
+            uid,
+            success=vitals_ok,
+            message=sync_result.get("message"),
+            activities_synced=sync_result.get("activities_synced", 0),
+            health_days_synced=sync_result.get("health_days_synced", 0),
+        )
+        try:
+            _save_garmin_token_to_firestore(uid, client.garth.dumps())
+        except Exception:
+            pass
+        if vitals_ok:
+            _set_last_successful_sync(uid)
     try:
         udoc = db.collection("users").document(uid).get(timeout=_firestore_timeout_sec()).to_dict() or {}
         if udoc.get("mi_fitness_linked"):
@@ -1878,34 +1920,35 @@ def _delta_garmin(uid: str, last: datetime | None) -> int:
     token = _get_garmin_token_from_firestore(uid)
     if not token:
         return 0
-    client = Garmin()
-    client.login(tokenstore=token)
-    now = datetime.now(timezone.utc).date()
-    if last:
-        start = last.astimezone(timezone.utc).date() - timedelta(days=1)
-    else:
-        start = now - timedelta(days=7)
-    if start > now:
-        start = now - timedelta(days=1)
-    max_days = int(os.getenv("BACKFILL_DAYS", "60"))
-    days_span = (now - start).days + 1
-    num_days = min(max(days_span, 1), max_days)
-    _, hw = _sync_daily_health(client, uid, num_days=num_days)
-    total_writes = hw
-    cur = start
-    while cur <= now:
-        chunk_end = min(cur + timedelta(days=9), now)
+    with _uid_garmin_lock(uid):
+        client = Garmin()
+        client.login(tokenstore=token)
+        now = datetime.now(timezone.utc).date()
+        if last:
+            start = last.astimezone(timezone.utc).date() - timedelta(days=1)
+        else:
+            start = now - timedelta(days=7)
+        if start > now:
+            start = now - timedelta(days=1)
+        max_days = int(os.getenv("BACKFILL_DAYS", "60"))
+        days_span = (now - start).days + 1
+        num_days = min(max(days_span, 1), max_days)
+        _, hw = _sync_daily_health(client, uid, num_days=num_days)
+        total_writes = hw
+        cur = start
+        while cur <= now:
+            chunk_end = min(cur + timedelta(days=9), now)
+            try:
+                acts = client.get_activities_by_date(cur.isoformat(), chunk_end.isoformat())
+                if acts:
+                    total_writes += _ingest_garmin_activity_list(uid, acts)
+            except Exception as e:
+                logger.warning(f"delta garmin activities {cur}-{chunk_end}: {e}")
+            cur = chunk_end + timedelta(days=1)
         try:
-            acts = client.get_activities_by_date(cur.isoformat(), chunk_end.isoformat())
-            if acts:
-                total_writes += _ingest_garmin_activity_list(uid, acts)
-        except Exception as e:
-            logger.warning(f"delta garmin activities {cur}-{chunk_end}: {e}")
-        cur = chunk_end + timedelta(days=1)
-    try:
-        _save_garmin_token_to_firestore(uid, client.garth.dumps())
-    except Exception:
-        pass
+            _save_garmin_token_to_firestore(uid, client.garth.dumps())
+        except Exception:
+            pass
     return total_writes
 
 
@@ -2111,7 +2154,7 @@ async def garmin_sync_today(
     _require_db()
     uid = req.uid.strip()
     try:
-        return _run_garmin_sync_today(uid)
+        return await asyncio.to_thread(_run_garmin_sync_today, uid)
     except HTTPException:
         raise
     except (GarminConnectConnectionError, GarminConnectAuthenticationError, GarthException, GarthHTTPError) as e:
@@ -2146,17 +2189,17 @@ async def sync_delta(
         delta_writes = 0
         if "garmin" in sources:
             try:
-                delta_writes += _delta_garmin(uid, last)
+                delta_writes += await asyncio.to_thread(_delta_garmin, uid, last)
             except Exception as e:
                 logger.warning(f"delta garmin: {e}")
         if "strava" in sources and _strava_credentials_available(uid):
             try:
-                delta_writes += _delta_strava(uid, last)
+                delta_writes += await asyncio.to_thread(_delta_strava, uid, last)
             except Exception as e:
                 logger.warning(f"delta strava: {e}")
         if "mi_fitness" in sources:
             try:
-                delta_writes += _delta_mi_fitness(uid, last)
+                delta_writes += await asyncio.to_thread(_delta_mi_fitness, uid, last)
             except Exception as e:
                 logger.warning(f"delta mi_fitness: {e}")
         _set_last_successful_sync(uid)
@@ -3512,7 +3555,10 @@ def scheduled_sync():
         for user in users_g:
             try:
                 ud = user.to_dict() or {}
-                result = sync_user(user.id)
+                # Serializza col percorso HTTP (sync-today/delta) per non
+                # sovrascrivere il token dello stesso utente in parallelo.
+                with _uid_garmin_lock(user.id):
+                    result = sync_user(user.id)
                 if ud.get("mi_fitness_linked") and result.get("success"):
                     try:
                         _delta_mi_fitness(
